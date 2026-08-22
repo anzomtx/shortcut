@@ -6,14 +6,46 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { exportFrameAccurate, exportStreamCopy, isKeyframeAligned } from "./exporter.mjs";
+import { ExportQueue } from "./export-queue.mjs";
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_ROOT = path.resolve(SOURCE_DIRECTORY, "../public");
 const MAX_JSON_BYTES = 64 * 1024;
+const DEFAULT_PREFERENCES = {
+  version: 1,
+  sidebarCollapsed: true,
+  defaultEditMode: "remove",
+  libraryPath: null,
+  exportPath: null,
+  shortcuts: {
+    "ui.toggleSidebar": "KeyB",
+    "ui.openPreferences": "Mod+Comma",
+    "playback.toggle": "Space",
+    "playback.previousKeyframe": "Comma",
+    "playback.nextKeyframe": "Period",
+    "playback.backward1": "ArrowLeft",
+    "playback.forward1": "ArrowRight",
+    "playback.backward3": "Shift+ArrowLeft",
+    "playback.forward3": "Shift+ArrowRight",
+    "playback.backward6": "BracketLeft",
+    "playback.forward6": "BracketRight",
+    "playback.backward10": "Shift+BracketLeft",
+    "playback.forward10": "Shift+BracketRight",
+    "edit.markIn": "KeyI",
+    "edit.markOut": "KeyO",
+    "edit.applyRange": "KeyX",
+    "edit.removeSelected": "Delete",
+    "edit.undo": "Mod+KeyZ",
+    "edit.redo": "Mod+Shift+KeyZ",
+    "project.save": "Mod+KeyS",
+  },
+};
 
 const STATIC_FILES = new Map([
   ["/", ["index.html", "text/html; charset=utf-8"]],
   ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
+  ["/edit-model.js", ["edit-model.js", "text/javascript; charset=utf-8"]],
+  ["/shortcut-model.js", ["shortcut-model.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
 ]);
 
@@ -234,6 +266,106 @@ async function readProjects(projectsPath) {
   }
 }
 
+async function readExportJobs(exportsPath) {
+  try {
+    const jobs = JSON.parse(await readFile(exportsPath, "utf8"));
+    if (!Array.isArray(jobs)) throw new Error("Persisted export queue is invalid");
+    return jobs.map((job) => ({
+      ...job,
+      status: ["completed", "failed", "stopped"].includes(job.status) ? job.status : "paused",
+      progress: ["completed", "failed", "stopped"].includes(job.status) ? job.progress : 0,
+      startedAt: ["completed", "failed", "stopped"].includes(job.status) ? job.startedAt : null,
+      media: {
+        path: job.sourcePath,
+        analysis: { audio: job.hasAudio ? [{}] : [] },
+      },
+    }));
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+function serializePersistedExport(job) {
+  return {
+    id: job.id,
+    projectId: job.projectId,
+    projectName: job.projectName,
+    mode: job.mode,
+    status: job.status,
+    progress: job.progress,
+    outputName: job.outputName,
+    outputPath: job.outputPath,
+    error: job.error,
+    createdAt: job.createdAt,
+    completedAt: job.completedAt,
+    startedAt: job.startedAt ?? null,
+    sourcePath: job.media.path,
+    hasAudio: job.media.analysis.audio.length > 0,
+    segments: job.segments,
+  };
+}
+
+async function readPreferences(preferencesPath) {
+  try {
+    const saved = JSON.parse(await readFile(preferencesPath, "utf8"));
+    return {
+      ...DEFAULT_PREFERENCES,
+      ...saved,
+      shortcuts: { ...DEFAULT_PREFERENCES.shortcuts, ...saved.shortcuts },
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") return structuredClone(DEFAULT_PREFERENCES);
+    throw error;
+  }
+}
+
+function validatePreferences(body) {
+  if (
+    typeof body.sidebarCollapsed !== "boolean" ||
+    (body.defaultEditMode !== "include" && body.defaultEditMode !== "remove") ||
+    typeof body.libraryPath !== "string" ||
+    !body.libraryPath.trim() ||
+    !path.isAbsolute(body.libraryPath) ||
+    typeof body.exportPath !== "string" ||
+    !body.exportPath.trim() ||
+    !path.isAbsolute(body.exportPath) ||
+    !body.shortcuts ||
+    typeof body.shortcuts !== "object" ||
+    Array.isArray(body.shortcuts)
+  ) {
+    const error = new Error("Preferences are invalid");
+    error.statusCode = 400;
+    throw error;
+  }
+  const entries = Object.entries(body.shortcuts);
+  if (entries.length > 100) {
+    const error = new Error("Too many shortcut mappings");
+    error.statusCode = 400;
+    throw error;
+  }
+  const shortcuts = {};
+  for (const [action, shortcut] of entries) {
+    if (
+      !/^[a-zA-Z][a-zA-Z0-9.]{0,63}$/.test(action) ||
+      (shortcut !== null && (typeof shortcut !== "string" || shortcut.length > 64))
+    ) {
+      const error = new Error("Shortcut mappings are invalid");
+      error.statusCode = 400;
+      throw error;
+    }
+    shortcuts[action] = shortcut;
+  }
+  return {
+    version: 1,
+    sidebarCollapsed: body.sidebarCollapsed,
+    defaultEditMode: body.defaultEditMode,
+    libraryPath: path.normalize(body.libraryPath.trim()),
+    exportPath: path.normalize(body.exportPath.trim()),
+    shortcuts,
+  };
+}
+
 function validateProjectInput(body, mediaRegistry) {
   if (typeof body.name !== "string" || !body.name.trim() || body.name.trim().length > 100) {
     const error = new Error("Project name must be between 1 and 100 characters");
@@ -281,6 +413,7 @@ function validateProjectInput(body, mediaRegistry) {
 
   return {
     name: body.name.trim(),
+    editMode: body.editMode === "remove" ? "remove" : "include",
     source: {
       mediaId: media.id,
       relativePath: media.relativePath,
@@ -288,6 +421,25 @@ function validateProjectInput(body, mediaRegistry) {
     },
     segments,
   };
+}
+
+function validateProjectImport(body) {
+  if (body?.format !== "shortcut-project" || body.version !== 1 || !body.project) {
+    const error = new Error("File is not a supported Shortcut project");
+    error.statusCode = 400;
+    throw error;
+  }
+  const project = body.project;
+  if (
+    typeof project.source?.relativePath !== "string" ||
+    !project.source.relativePath ||
+    path.isAbsolute(project.source.relativePath)
+  ) {
+    const error = new Error("Imported project source path is invalid");
+    error.statusCode = 400;
+    throw error;
+  }
+  return project;
 }
 
 function createExportName(project, mode, requestedName, jobId) {
@@ -319,11 +471,50 @@ function serializeExport(job) {
     status: job.status,
     progress: job.progress,
     outputName: job.outputName,
-    outputPath: job.status === "completed" ? job.outputPath : null,
+    outputPath: job.outputPath,
     error: job.error,
     createdAt: job.createdAt,
     completedAt: job.completedAt,
+    startedAt: job.startedAt ?? null,
   };
+}
+
+function runTool(toolPath, args, label) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(toolPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", (error) => {
+      reject(new Error(`${label} was not found at "${toolPath}". Install an Intel-compatible FFmpeg package or set ${label.toUpperCase()}_PATH. (${error.message})`));
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`${label} failed its startup check: ${Buffer.concat(stderr).toString("utf8").trim() || `exit code ${code}`}`));
+        return;
+      }
+      resolve(Buffer.concat(stdout).toString("utf8"));
+    });
+  });
+}
+
+export async function verifyRuntime({
+  ffmpegPath = process.env.FFMPEG_PATH ?? "ffmpeg",
+  ffprobePath = process.env.FFPROBE_PATH ?? "ffprobe",
+} = {}) {
+  const major = Number(process.versions.node.split(".")[0]);
+  if (major !== 22) console.warn(`Shortcut is tested with Node.js 22 LTS; current version is ${process.version}.`);
+  const [encoders] = await Promise.all([
+    runTool(ffmpegPath, ["-hide_banner", "-encoders"], "ffmpeg"),
+    runTool(ffprobePath, ["-version"], "ffprobe"),
+  ]);
+  if (!/\blibx264\b/.test(encoders)) {
+    throw new Error(`FFmpeg at "${ffmpegPath}" does not include the required libx264 encoder.`);
+  }
+  if (!/^\s*A.....\s+aac\s/m.test(encoders)) {
+    throw new Error(`FFmpeg at "${ffmpegPath}" does not include the required AAC encoder.`);
+  }
 }
 
 function parseRange(header, size) {
@@ -397,18 +588,38 @@ export async function createApp(options = {}) {
   const cacheDirectory = path.join(dataRoot, "metadata");
   const exportWorkRoot = path.join(dataRoot, "export-work");
   const projectsPath = path.join(dataRoot, "projects.json");
+  const preferencesPath = path.join(dataRoot, "preferences.json");
+  const exportsPath = path.join(dataRoot, "exports.json");
   await Promise.all([
     mkdir(configuredRoot, { recursive: true }),
     mkdir(cacheDirectory, { recursive: true }),
     mkdir(configuredOutputRoot, { recursive: true }),
     mkdir(exportWorkRoot, { recursive: true }),
   ]);
-  const mediaRoot = await realpath(configuredRoot);
-  const outputRoot = await realpath(configuredOutputRoot);
+  let mediaRoot = await realpath(configuredRoot);
+  let outputRoot = await realpath(configuredOutputRoot);
   const mediaRegistry = new Map();
-  const exportJobs = new Map();
   const projects = await readProjects(projectsPath);
+  const restoredExportJobs = await readExportJobs(exportsPath);
+  let preferences = await readPreferences(preferencesPath);
+  const savedMediaRoot = path.resolve(preferences.libraryPath ?? mediaRoot);
+  const savedOutputRoot = path.resolve(preferences.exportPath ?? outputRoot);
+  await Promise.all([
+    mkdir(savedMediaRoot, { recursive: true }),
+    mkdir(savedOutputRoot, { recursive: true }),
+  ]);
+  [mediaRoot, outputRoot] = await Promise.all([
+    realpath(savedMediaRoot),
+    realpath(savedOutputRoot),
+  ]);
+  preferences = {
+    ...preferences,
+    libraryPath: mediaRoot,
+    exportPath: outputRoot,
+  };
   let projectWrite = Promise.resolve();
+  let preferenceWrite = Promise.resolve();
+  let exportWrite = Promise.resolve();
 
   function persistProjects() {
     projectWrite = projectWrite.catch(() => {}).then(async () => {
@@ -419,9 +630,149 @@ export async function createApp(options = {}) {
     return projectWrite;
   }
 
+  function persistPreferences() {
+    preferenceWrite = preferenceWrite.catch(() => {}).then(async () => {
+      const temporaryPath = `${preferencesPath}.${process.pid}.tmp`;
+      await writeFile(temporaryPath, JSON.stringify(preferences, null, 2));
+      await rename(temporaryPath, preferencesPath);
+    });
+    return preferenceWrite;
+  }
+
+  function persistExportJobs(jobs) {
+    const snapshot = jobs.map(serializePersistedExport);
+    exportWrite = exportWrite.catch(() => {}).then(async () => {
+      const temporaryPath = `${exportsPath}.${process.pid}.tmp`;
+      await writeFile(temporaryPath, JSON.stringify(snapshot, null, 2));
+      await rename(temporaryPath, exportsPath);
+    });
+    return exportWrite;
+  }
+
+  async function registerMedia(relativePath) {
+    if (typeof relativePath !== "string" || path.isAbsolute(relativePath)) {
+      const error = new Error("relativePath must be a relative file path");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const requestedPath = path.resolve(mediaRoot, relativePath);
+    if (!isWithin(mediaRoot, requestedPath)) {
+      const error = new Error("File is outside the configured media root");
+      error.statusCode = 403;
+      throw error;
+    }
+
+    const filePath = await realpath(requestedPath);
+    if (!isWithin(mediaRoot, filePath)) {
+      const error = new Error("File is outside the configured media root");
+      error.statusCode = 403;
+      throw error;
+    }
+
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile() || path.extname(filePath).toLowerCase() !== ".mp4") {
+      const error = new Error("Only MP4 files can be registered");
+      error.statusCode = 415;
+      throw error;
+    }
+
+    const id = createHash("sha256").update(filePath).digest("hex").slice(0, 24);
+    let analysis = await readCachedAnalysis(cacheDirectory, id, fileStat);
+    if (!analysis) {
+      analysis = await analyzeMedia(filePath, ffprobePath);
+      if (analysis) await writeCachedAnalysis(cacheDirectory, id, fileStat, analysis);
+    }
+    if (!analysis || analysis.video.codec !== "h264") {
+      const error = new Error("The MP4 must contain an H.264 video stream");
+      error.statusCode = 415;
+      throw error;
+    }
+
+    const media = {
+      id,
+      name: path.basename(filePath),
+      relativePath: path.relative(mediaRoot, filePath),
+      path: filePath,
+      size: fileStat.size,
+      analysis,
+    };
+    mediaRegistry.set(id, media);
+    return media;
+  }
+
+  const exportQueue = new ExportQueue({
+    jobs: restoredExportJobs,
+    onChange: (_job, jobs) => {
+      persistExportJobs(jobs).catch((error) => console.error("Unable to persist export queue", error));
+    },
+    runner: async (job, control) => {
+      const exportOptions = {
+        ffmpegPath,
+        media: job.media,
+        segments: job.segments,
+        outputPath: job.outputPath,
+        signal: control.signal,
+        setProcess: control.setProcess,
+        waitIfPaused: control.waitIfPaused,
+        onProgress: (progress) => {
+          if (Number.isFinite(progress)) {
+            job.progress = Math.max(job.progress, Math.round(progress * 1_000) / 1_000);
+          }
+        },
+      };
+      if (job.mode === "fast") {
+        await exportStreamCopy({ ...exportOptions, workRoot: exportWorkRoot });
+      } else {
+        await exportFrameAccurate(exportOptions);
+      }
+    },
+  });
+
   return createServer(async (request, response) => {
     try {
       const url = new URL(request.url, "http://localhost");
+
+      if (request.method === "GET" && url.pathname === "/api/preferences") {
+        sendJson(response, 200, preferences);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/exports") {
+        sendJson(response, 200, { jobs: exportQueue.list().map(serializeExport) });
+        return;
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/exports") {
+        exportQueue.clear();
+        await exportWrite;
+        response.writeHead(204, { "Cache-Control": "no-store" });
+        response.end();
+        return;
+      }
+
+      if (request.method === "PUT" && url.pathname === "/api/preferences") {
+        const nextPreferences = validatePreferences(await readJson(request));
+        await Promise.all([
+          mkdir(nextPreferences.libraryPath, { recursive: true }),
+          mkdir(nextPreferences.exportPath, { recursive: true }),
+        ]);
+        const [nextMediaRoot, nextOutputRoot] = await Promise.all([
+          realpath(nextPreferences.libraryPath),
+          realpath(nextPreferences.exportPath),
+        ]);
+        if (nextMediaRoot !== mediaRoot) mediaRegistry.clear();
+        mediaRoot = nextMediaRoot;
+        outputRoot = nextOutputRoot;
+        preferences = {
+          ...nextPreferences,
+          libraryPath: mediaRoot,
+          exportPath: outputRoot,
+        };
+        await persistPreferences();
+        sendJson(response, 200, preferences);
+        return;
+      }
 
       if (request.method === "POST" && url.pathname === "/api/exports") {
         const body = await readJson(request);
@@ -465,49 +816,44 @@ export async function createApp(options = {}) {
           projectId: project.id,
           projectName: project.name,
           mode: body.mode,
-          status: "queued",
+          status: "paused",
           progress: 0,
           outputName,
           outputPath: path.join(outputRoot, outputName),
           error: null,
           createdAt: new Date().toISOString(),
           completedAt: null,
+          startedAt: null,
+          media,
+          segments: project.segments.map((segment) => ({ ...segment })),
         };
-        exportJobs.set(id, job);
+        exportQueue.add(job);
+        await exportWrite;
         sendJson(response, 202, serializeExport(job));
+        return;
+      }
 
-        queueMicrotask(async () => {
-          job.status = "running";
-          try {
-            const exportOptions = {
-              ffmpegPath,
-              media,
-              segments: project.segments,
-              outputPath: job.outputPath,
-              onProgress: (progress) => {
-                job.progress = Math.max(job.progress, Math.round(progress * 1_000) / 1_000);
-              },
-            };
-            if (job.mode === "fast") {
-              await exportStreamCopy({ ...exportOptions, workRoot: exportWorkRoot });
-            } else {
-              await exportFrameAccurate(exportOptions);
-            }
-            job.status = "completed";
-            job.progress = 1;
-            job.completedAt = new Date().toISOString();
-          } catch (error) {
-            job.status = "failed";
-            job.error = error.message;
-            job.completedAt = new Date().toISOString();
-          }
-        });
+      const exportControlMatch = /^\/api\/exports\/([a-f0-9-]{36})\/(pause|resume|stop)$/.exec(url.pathname);
+      if (request.method === "POST" && exportControlMatch) {
+        const [, id, action] = exportControlMatch;
+        const changed = exportQueue[action](id);
+        const job = exportQueue.get(id);
+        if (!job) {
+          sendJson(response, 404, { error: "Export job not found" });
+          return;
+        }
+        if (!changed) {
+          sendJson(response, 409, { error: `Export cannot ${action} while ${job.status}` });
+          return;
+        }
+        await exportWrite;
+        sendJson(response, 200, serializeExport(job));
         return;
       }
 
       const exportMatch = /^\/api\/exports\/([a-f0-9-]{36})$/.exec(url.pathname);
       if (request.method === "GET" && exportMatch) {
-        const job = exportJobs.get(exportMatch[1]);
+        const job = exportQueue.get(exportMatch[1]);
         if (!job) {
           sendJson(response, 404, { error: "Export job not found" });
           return;
@@ -523,6 +869,7 @@ export async function createApp(options = {}) {
             id: project.id,
             name: project.name,
             sourceName: project.source.name,
+            editMode: project.editMode ?? "include",
             segmentCount: project.segments.length,
             updatedAt: project.updatedAt,
           }));
@@ -537,6 +884,48 @@ export async function createApp(options = {}) {
         projects.set(project.id, project);
         await persistProjects();
         sendJson(response, 201, project);
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/projects/import") {
+        const imported = validateProjectImport(await readJson(request));
+        const media = await registerMedia(imported.source.relativePath);
+        const input = validateProjectInput({
+          name: imported.name,
+          editMode: imported.editMode,
+          sourceMediaId: media.id,
+          segments: imported.segments,
+        }, mediaRegistry);
+        const now = new Date().toISOString();
+        const project = { id: randomUUID(), ...input, createdAt: now, updatedAt: now };
+        projects.set(project.id, project);
+        await persistProjects();
+        sendJson(response, 201, project);
+        return;
+      }
+
+      const projectExportMatch = /^\/api\/projects\/([a-f0-9-]{36})\/export$/.exec(url.pathname);
+      if (projectExportMatch && request.method === "GET") {
+        const project = projects.get(projectExportMatch[1]);
+        if (!project) {
+          sendJson(response, 404, { error: "Project not found" });
+          return;
+        }
+        const exportDocument = {
+          format: "shortcut-project",
+          version: 1,
+          exportedAt: new Date().toISOString(),
+          project,
+        };
+        const body = JSON.stringify(exportDocument, null, 2);
+        const fileName = `${project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 64) || "shortcut-project"}.json`;
+        response.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": Buffer.byteLength(body),
+          "Content-Disposition": `attachment; filename="${fileName}"`,
+          "Cache-Control": "no-store",
+        });
+        response.end(body);
         return;
       }
 
@@ -570,6 +959,18 @@ export async function createApp(options = {}) {
         return;
       }
 
+      if (projectMatch && request.method === "DELETE") {
+        if (!projects.has(projectMatch[1])) {
+          sendJson(response, 404, { error: "Project not found" });
+          return;
+        }
+        projects.delete(projectMatch[1]);
+        await persistProjects();
+        response.writeHead(204, { "Cache-Control": "no-store" });
+        response.end();
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/api/files") {
         sendJson(response, 200, {
           mediaRoot,
@@ -580,54 +981,7 @@ export async function createApp(options = {}) {
 
       if (request.method === "POST" && url.pathname === "/api/media") {
         const body = await readJson(request);
-        if (typeof body.relativePath !== "string" || path.isAbsolute(body.relativePath)) {
-          const error = new Error("relativePath must be a relative file path");
-          error.statusCode = 400;
-          throw error;
-        }
-
-        const requestedPath = path.resolve(mediaRoot, body.relativePath);
-        if (!isWithin(mediaRoot, requestedPath)) {
-          const error = new Error("File is outside the configured media root");
-          error.statusCode = 403;
-          throw error;
-        }
-
-        const filePath = await realpath(requestedPath);
-        if (!isWithin(mediaRoot, filePath)) {
-          const error = new Error("File is outside the configured media root");
-          error.statusCode = 403;
-          throw error;
-        }
-
-        const fileStat = await stat(filePath);
-        if (!fileStat.isFile() || path.extname(filePath).toLowerCase() !== ".mp4") {
-          const error = new Error("Only MP4 files can be registered");
-          error.statusCode = 415;
-          throw error;
-        }
-
-        const id = createHash("sha256").update(filePath).digest("hex").slice(0, 24);
-        let analysis = await readCachedAnalysis(cacheDirectory, id, fileStat);
-        if (!analysis) {
-          analysis = await analyzeMedia(filePath, ffprobePath);
-          if (analysis) await writeCachedAnalysis(cacheDirectory, id, fileStat, analysis);
-        }
-        if (!analysis || analysis.video.codec !== "h264") {
-          const error = new Error("The MP4 must contain an H.264 video stream");
-          error.statusCode = 415;
-          throw error;
-        }
-
-        const media = {
-          id,
-          name: path.basename(filePath),
-          relativePath: path.relative(mediaRoot, filePath),
-          path: filePath,
-          size: fileStat.size,
-          analysis,
-        };
-        mediaRegistry.set(id, media);
+        const media = await registerMedia(body.relativePath);
         sendJson(response, 201, serializeMedia(media));
         return;
       }
@@ -689,6 +1043,7 @@ export async function createApp(options = {}) {
 async function main() {
   const port = Number(process.env.PORT ?? 4173);
   const host = "127.0.0.1";
+  await verifyRuntime();
   const server = await createApp();
   server.listen(port, host, () => {
     console.log(`Shortcut is running at http://${host}:${port}`);

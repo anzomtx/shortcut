@@ -7,7 +7,9 @@ function seconds(timestampUs) {
   return (timestampUs / 1_000_000).toFixed(6);
 }
 
-function runFfmpeg(ffmpegPath, args, options = {}) {
+async function runFfmpeg(ffmpegPath, args, options = {}) {
+  await options.beforeProcess?.();
+  if (options.signal?.aborted) throw new DOMException("Export stopped", "AbortError");
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, {
       cwd: options.cwd,
@@ -15,6 +17,18 @@ function runFfmpeg(ffmpegPath, args, options = {}) {
     });
     let progressBuffer = "";
     let stderr = "";
+    let aborted = false;
+    let killTimer;
+
+    const handleAbort = () => {
+      aborted = true;
+      child.kill("SIGCONT");
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      killTimer.unref?.();
+    };
+    options.onProcess?.(child);
+    options.signal?.addEventListener("abort", handleAbort, { once: true });
 
     child.stdout.on("data", (chunk) => {
       progressBuffer += chunk.toString("utf8");
@@ -22,7 +36,8 @@ function runFfmpeg(ffmpegPath, args, options = {}) {
       progressBuffer = lines.pop();
       for (const line of lines) {
         const [key, value] = line.trim().split("=");
-        if (key === "out_time_us") options.onProgress?.(Number(value));
+        const progressUs = Number(value);
+        if (key === "out_time_us" && Number.isFinite(progressUs)) options.onProgress?.(progressUs);
       }
     });
     child.stderr.on("data", (chunk) => {
@@ -30,7 +45,11 @@ function runFfmpeg(ffmpegPath, args, options = {}) {
     });
     child.on("error", (error) => reject(new Error(`Unable to run FFmpeg: ${error.message}`)));
     child.on("close", (code) => {
-      if (code === 0) resolve();
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", handleAbort);
+      options.onProcess?.(null);
+      if (aborted) reject(new DOMException("Export stopped", "AbortError"));
+      else if (code === 0) resolve();
       else reject(new Error(stderr.trim() || `FFmpeg exited with code ${code}`));
     });
   });
@@ -56,6 +75,9 @@ export async function exportStreamCopy({
   outputPath,
   workRoot,
   onProgress,
+  signal,
+  setProcess,
+  waitIfPaused,
 }) {
   await Promise.all([mkdir(path.dirname(outputPath), { recursive: true }), mkdir(workRoot, { recursive: true })]);
   const workDirectory = await mkdtemp(path.join(workRoot, "fast-"));
@@ -95,6 +117,9 @@ export async function exportStreamCopy({
         ],
         {
           cwd: workDirectory,
+          signal,
+          onProcess: setProcess,
+          beforeProcess: waitIfPaused,
           onProgress: (currentUs) => {
             const extractionProgress = (completedDurationUs + Math.min(currentUs, segmentDurationUs)) / totalDurationUs;
             onProgress?.(Math.min(extractionProgress * 0.85, 0.85));
@@ -130,6 +155,9 @@ export async function exportStreamCopy({
       ],
       {
         cwd: workDirectory,
+        signal,
+        onProcess: setProcess,
+        beforeProcess: waitIfPaused,
         onProgress: (currentUs) => {
           onProgress?.(0.85 + Math.min(currentUs / totalDurationUs, 1) * 0.14);
         },
@@ -151,6 +179,9 @@ export async function exportFrameAccurate({
   segments,
   outputPath,
   onProgress,
+  signal,
+  setProcess,
+  waitIfPaused,
 }) {
   await mkdir(path.dirname(outputPath), { recursive: true });
   const temporaryOutput = path.join(path.dirname(outputPath), `.${path.basename(outputPath)}.${randomUUID()}.tmp.mp4`);
@@ -200,6 +231,9 @@ export async function exportFrameAccurate({
 
   try {
     await runFfmpeg(ffmpegPath, args, {
+      signal,
+      onProcess: setProcess,
+      beforeProcess: waitIfPaused,
       onProgress: (currentUs) => onProgress?.(Math.min(currentUs / totalDurationUs, 0.99)),
     });
     await rename(temporaryOutput, outputPath);

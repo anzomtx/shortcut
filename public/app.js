@@ -1,3 +1,41 @@
+import {
+  buildSequenceLayout,
+  getSequenceDurationUs,
+  mapSequenceToSource,
+  subtractSequenceRange,
+} from "./edit-model.js";
+import { findShortcutAction, normalizeShortcutEvent } from "./shortcut-model.js";
+
+const DEFAULT_PREFERENCES = {
+  version: 1,
+  sidebarCollapsed: true,
+  defaultEditMode: "remove",
+  libraryPath: "",
+  exportPath: "",
+  shortcuts: {
+    "ui.toggleSidebar": "KeyB",
+    "ui.openPreferences": "Mod+Comma",
+    "playback.toggle": "Space",
+    "playback.previousKeyframe": "Comma",
+    "playback.nextKeyframe": "Period",
+    "playback.backward1": "ArrowLeft",
+    "playback.forward1": "ArrowRight",
+    "playback.backward3": "Shift+ArrowLeft",
+    "playback.forward3": "Shift+ArrowRight",
+    "playback.backward6": "BracketLeft",
+    "playback.forward6": "BracketRight",
+    "playback.backward10": "Shift+BracketLeft",
+    "playback.forward10": "Shift+BracketRight",
+    "edit.markIn": "KeyI",
+    "edit.markOut": "KeyO",
+    "edit.applyRange": "KeyX",
+    "edit.removeSelected": "Delete",
+    "edit.undo": "Mod+KeyZ",
+    "edit.redo": "Mod+Shift+KeyZ",
+    "project.save": "Mod+KeyS",
+  },
+};
+
 const video = document.querySelector("#video");
 const viewerEmpty = document.querySelector("#viewer-empty");
 const viewerTitle = document.querySelector("#viewer-title");
@@ -7,31 +45,86 @@ const fileList = document.querySelector("#file-list");
 const notice = document.querySelector("#notice");
 const refreshButton = document.querySelector("#refresh-button");
 const serverStatus = document.querySelector("#server-status");
-const previousKeyframeButton = document.querySelector("#previous-keyframe");
-const nextKeyframeButton = document.querySelector("#next-keyframe");
 const playheadTime = document.querySelector("#playhead-time");
 const timeline = document.querySelector("#timeline");
-const markInButton = document.querySelector("#mark-in");
-const markOutButton = document.querySelector("#mark-out");
-const addSegmentButton = document.querySelector("#add-segment");
 const inPoint = document.querySelector("#in-point");
 const outPoint = document.querySelector("#out-point");
 const editedDuration = document.querySelector("#edited-duration");
 const segmentList = document.querySelector("#segment-list");
+const applyRangeButton = document.querySelector("#apply-range");
+const includeModeButton = document.querySelector("#include-mode");
+const removeModeButton = document.querySelector("#remove-mode");
 const projectName = document.querySelector("#project-name");
 const saveProjectButton = document.querySelector("#save-project");
 const projectList = document.querySelector("#project-list");
+const importProjectButton = document.querySelector("#import-project");
+const projectFileInput = document.querySelector("#project-file-input");
 const exportFastButton = document.querySelector("#export-fast");
 const exportAccurateButton = document.querySelector("#export-accurate");
-const exportProgress = document.querySelector("#export-progress");
-const exportStatus = document.querySelector("#export-status");
+const exportQueueList = document.querySelector("#export-queue-list");
+const exportQueueSummary = document.querySelector("#export-queue-summary");
+const clearExportQueueButton = document.querySelector("#clear-export-queue");
+const appLayout = document.querySelector("#app-layout");
+const libraryPanel = document.querySelector("#library-panel");
+const panelResizer = document.querySelector("#panel-resizer");
+const panelTabs = [...document.querySelectorAll("[data-panel-tab]")];
+const panelContents = [...document.querySelectorAll("[data-panel-content]")];
+const toggleSidebarButton = document.querySelector("#toggle-sidebar");
+const openPreferencesButton = document.querySelector("#open-preferences");
+const preferencesDialog = document.querySelector("#preferences-dialog");
+const preferencesForm = document.querySelector("#preferences-form");
+const closePreferencesButton = document.querySelector("#close-preferences");
+const defaultEditModeSelect = document.querySelector("#default-edit-mode");
+const libraryPathInput = document.querySelector("#library-path");
+const exportPathInput = document.querySelector("#export-path");
+const shortcutList = document.querySelector("#shortcut-list");
+const preferencesMessage = document.querySelector("#preferences-message");
+const resetShortcutsButton = document.querySelector("#reset-shortcuts");
 
 let currentMedia = null;
 let keyframesUs = [];
 let markInUs = 0;
 let markOutUs = 0;
 let segments = [];
+let selectedSegmentId = null;
 let currentProjectId = null;
+let selectedMediaPath = null;
+let selectedProjectId = null;
+let selectedExportJobId = null;
+let editMode = "remove";
+let sequencePlayheadUs = 0;
+let activeSegmentIndex = 0;
+let programmaticSeek = false;
+let undoStack = [];
+let redoStack = [];
+let preferences = structuredClone(DEFAULT_PREFERENCES);
+let preferencesDraft = structuredClone(DEFAULT_PREFERENCES);
+let capturingActionId = null;
+let savingPreferences = false;
+
+const ICON_PATHS = {
+  open: ["M3 7h6l2 2h10v9H3z", "M3 7V5h7l2 2"],
+  download: ["M12 3v11", "m8 10 4 4 4-4", "M5 19h14"],
+  delete: ["M4 7h16", "M9 7V4h6v3", "m7 7-1 7H8L7 7"],
+};
+
+function makeIconButton(label, paths) {
+  const button = document.createElement("button");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  button.type = "button";
+  button.className = "icon-button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  for (const data of paths) {
+    const pathElement = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    pathElement.setAttribute("d", data);
+    svg.append(pathElement);
+  }
+  button.append(svg);
+  return button;
+}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes === 0) return "0 B";
@@ -59,6 +152,38 @@ function formatTimeUs(timestampUs) {
   return `${[hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":")}.${String(milliseconds).padStart(3, "0")}`;
 }
 
+function sequenceLayout() {
+  return buildSequenceLayout(segments);
+}
+
+function sequenceDurationUs() {
+  return getSequenceDurationUs(segments);
+}
+
+function sequenceToSource(timestampUs) {
+  return mapSequenceToSource(segments, timestampUs);
+}
+
+function sourceToSequence(sourceUs, preferredIndex = activeSegmentIndex) {
+  const layout = sequenceLayout();
+  const preferred = layout[preferredIndex];
+  if (preferred && sourceUs >= preferred.segment.inUs && sourceUs <= preferred.segment.outUs) {
+    return preferred.sequenceInUs + sourceUs - preferred.segment.inUs;
+  }
+  const item = layout.find(
+    (candidate) => sourceUs >= candidate.segment.inUs && sourceUs < candidate.segment.outUs,
+  );
+  return item ? item.sequenceInUs + sourceUs - item.segment.inUs : null;
+}
+
+function timelineDurationUs() {
+  return editMode === "remove" ? sequenceDurationUs() : currentMedia?.durationUs ?? 0;
+}
+
+function currentEditTimeUs() {
+  return editMode === "remove" ? sequencePlayheadUs : Math.round(video.currentTime * 1_000_000);
+}
+
 function isKeyframe(timestampUs) {
   let low = 0;
   let high = keyframesUs.length;
@@ -70,6 +195,19 @@ function isKeyframe(timestampUs) {
   return [keyframesUs[low - 1], keyframesUs[low]].some(
     (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= 2_000,
   );
+}
+
+function sequenceKeyframesUs() {
+  if (editMode !== "remove") return keyframesUs;
+  const result = [];
+  for (const item of sequenceLayout()) {
+    for (const keyframe of keyframesUs) {
+      if (keyframe < item.segment.inUs) continue;
+      if (keyframe >= item.segment.outUs) break;
+      result.push(item.sequenceInUs + keyframe - item.segment.inUs);
+    }
+  }
+  return result;
 }
 
 function drawTimeline() {
@@ -84,26 +222,37 @@ function drawTimeline() {
   context.fillStyle = "#0a0b09";
   context.fillRect(0, 0, width, height);
 
-  if (!currentMedia?.durationUs) return;
-  const toX = (timestampUs) => (timestampUs / currentMedia.durationUs) * width;
-
+  const durationUs = timelineDurationUs();
+  if (!currentMedia || durationUs <= 0) return;
+  const toX = (timestampUs) => (timestampUs / durationUs) * width;
   context.fillStyle = "#36382f";
   context.fillRect(0, height / 2 - 1, width, 2);
 
-  context.fillStyle = "rgba(209, 254, 63, 0.7)";
-  const keyframeStep = Math.max(1, Math.ceil(keyframesUs.length / Math.max(width / 3, 1)));
-  for (let index = 0; index < keyframesUs.length; index += keyframeStep) {
-    const x = Math.round(toX(keyframesUs[index]));
-    context.fillRect(x, height / 2 - 8, 1, 16);
+  if (editMode === "remove") {
+    for (const item of sequenceLayout()) {
+      const start = toX(item.sequenceInUs);
+      const clipWidth = Math.max(2, toX(item.sequenceOutUs) - start);
+      context.fillStyle = item.index % 2 === 0 ? "rgba(91, 181, 255, 0.34)" : "rgba(91, 181, 255, 0.22)";
+      context.fillRect(start, 8, clipWidth, height - 16);
+      context.strokeStyle = "#5bb5ff";
+      context.strokeRect(start + 0.5, 8.5, clipWidth - 1, height - 17);
+    }
+  } else {
+    for (const segment of segments) {
+      const start = toX(segment.inUs);
+      const clipWidth = Math.max(2, toX(segment.outUs) - start);
+      context.fillStyle = "rgba(91, 181, 255, 0.38)";
+      context.fillRect(start, 8, clipWidth, height - 16);
+      context.strokeStyle = "#5bb5ff";
+      context.strokeRect(start + 0.5, 8.5, clipWidth - 1, height - 17);
+    }
   }
 
-  for (const segment of segments) {
-    const start = toX(segment.inUs);
-    const segmentWidth = Math.max(2, toX(segment.outUs) - start);
-    context.fillStyle = "rgba(91, 181, 255, 0.38)";
-    context.fillRect(start, 8, segmentWidth, height - 16);
-    context.strokeStyle = "#5bb5ff";
-    context.strokeRect(start + 0.5, 8.5, segmentWidth - 1, height - 17);
+  context.fillStyle = "rgba(209, 254, 63, 0.7)";
+  const visibleKeyframes = sequenceKeyframesUs();
+  const keyframeStep = Math.max(1, Math.ceil(visibleKeyframes.length / Math.max(width / 3, 1)));
+  for (let index = 0; index < visibleKeyframes.length; index += keyframeStep) {
+    context.fillRect(Math.round(toX(visibleKeyframes[index])), height / 2 - 8, 1, 16);
   }
 
   context.fillStyle = "#f0a36e";
@@ -111,84 +260,314 @@ function drawTimeline() {
   context.fillStyle = "#ef6e68";
   context.fillRect(toX(markOutUs) - 2, 0, 2, height);
   context.fillStyle = "#f4f3ea";
-  context.fillRect(toX(video.currentTime * 1_000_000) - 1, 0, 2, height);
+  context.fillRect(toX(currentEditTimeUs()) - 1, 0, 2, height);
 }
 
 function renderMarks() {
-  inPoint.value = `In ${formatTimeUs(markInUs)}`;
-  outPoint.value = `Out ${formatTimeUs(markOutUs)}`;
-  inPoint.classList.toggle("on-keyframe", isKeyframe(markInUs));
-  addSegmentButton.disabled = !currentMedia || markOutUs <= markInUs;
+  const prefix = editMode === "remove" ? "Seq " : "";
+  inPoint.value = `${prefix}In ${formatTimeUs(markInUs)}`;
+  outPoint.value = `${prefix}Out ${formatTimeUs(markOutUs)}`;
+  const sourceIn = editMode === "remove" ? sequenceToSource(markInUs)?.sourceUs : markInUs;
+  inPoint.classList.toggle("on-keyframe", Number.isFinite(sourceIn) && isKeyframe(sourceIn));
+  applyRangeButton.disabled = !currentMedia || markOutUs <= markInUs;
   drawTimeline();
+  updateControlStates();
 }
 
 function renderSegments() {
   segmentList.replaceChildren();
-  const totalDurationUs = segments.reduce((total, segment) => total + segment.outUs - segment.inUs, 0);
-  editedDuration.value = `Edited duration ${formatTimeUs(totalDurationUs)}`;
+  selectedSegmentId = segments.some((segment) => segment.id === selectedSegmentId)
+    ? selectedSegmentId
+    : segments[0]?.id ?? null;
+  editedDuration.value = `Edited duration ${formatTimeUs(sequenceDurationUs())}`;
 
   if (segments.length === 0) {
     const empty = document.createElement("li");
     empty.className = "empty-segments";
-    empty.textContent = "Mark an in and out point, then add a segment.";
+    empty.textContent = editMode === "remove" ? "The sequence is empty. Undo or reset to restore it." : "Mark a source range, then include it.";
     segmentList.append(empty);
   }
 
+  const layout = sequenceLayout();
   segments.forEach((segment, index) => {
     const item = document.createElement("li");
     const jumpButton = document.createElement("button");
     const detail = document.createElement("span");
     const mode = document.createElement("small");
     const removeButton = document.createElement("button");
+    item.classList.toggle("selected", segment.id === selectedSegmentId);
+    item.addEventListener("click", () => {
+      selectedSegmentId = segment.id;
+      renderSegments();
+    });
     jumpButton.type = "button";
     jumpButton.textContent = String(index + 1).padStart(2, "0");
-    jumpButton.title = "Jump to segment in point";
-    jumpButton.addEventListener("click", () => {
-      video.currentTime = segment.inUs / 1_000_000;
+    jumpButton.title = "Jump to clip start";
+    jumpButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectedSegmentId = segment.id;
+      if (editMode === "remove") setSequencePlayhead(layout[index].sequenceInUs);
+      else video.currentTime = segment.inUs / 1_000_000;
+      renderSegments();
     });
     detail.textContent = `${formatTimeUs(segment.inUs)} - ${formatTimeUs(segment.outUs)}`;
     mode.textContent = isKeyframe(segment.inUs) ? "Fast export ready" : "Frame-accurate only";
     mode.className = isKeyframe(segment.inUs) ? "fast-ready" : "frame-only";
     removeButton.type = "button";
-    removeButton.textContent = "Remove";
-    removeButton.addEventListener("click", () => {
-      segments = segments.filter((candidate) => candidate.id !== segment.id);
-      renderSegments();
-      drawTimeline();
+    removeButton.textContent = editMode === "remove" ? "Remove clip" : "Remove";
+    removeButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectedSegmentId = segment.id;
+      executeAction("edit.removeSelected");
     });
     item.append(jumpButton, detail, mode, removeButton);
     segmentList.append(item);
   });
 
+  timeline.setAttribute("aria-valuemax", String(timelineDurationUs()));
   drawTimeline();
   updateExportControls();
+  updateControlStates();
 }
 
-function updateExportControls(updateMessage = true) {
+function snapshotEdit() {
+  return {
+    segments: segments.map((segment) => ({ ...segment })),
+    markInUs,
+    markOutUs,
+    sequencePlayheadUs,
+    selectedSegmentId,
+  };
+}
+
+function restoreEdit(snapshot) {
+  segments = snapshot.segments.map((segment) => ({ ...segment }));
+  markInUs = snapshot.markInUs;
+  markOutUs = snapshot.markOutUs;
+  sequencePlayheadUs = snapshot.sequencePlayheadUs;
+  selectedSegmentId = snapshot.selectedSegmentId;
+  if (editMode === "remove" && segments.length > 0) setSequencePlayhead(sequencePlayheadUs);
+  renderMarks();
+  renderSegments();
+}
+
+function recordEdit() {
+  undoStack.push(snapshotEdit());
+  if (undoStack.length > 100) undoStack.shift();
+  redoStack = [];
+}
+
+function resetHistory() {
+  undoStack = [];
+  redoStack = [];
+  updateControlStates();
+}
+
+function resetSequence(record = true) {
+  if (!currentMedia) return;
+  if (record) recordEdit();
+  segments = editMode === "remove"
+    ? [{ id: crypto.randomUUID(), inUs: 0, outUs: currentMedia.durationUs }]
+    : [];
+  selectedSegmentId = segments[0]?.id ?? null;
+  sequencePlayheadUs = 0;
+  markInUs = 0;
+  markOutUs = timelineDurationUs();
+  if (editMode === "remove" && segments.length > 0) setSequencePlayhead(0);
+  renderMarks();
+  renderSegments();
+}
+
+function hasModeEdits() {
+  if (!currentMedia) return false;
+  if (editMode === "include") return segments.length > 0;
+  return !(
+    segments.length === 1 &&
+    segments[0].inUs === 0 &&
+    segments[0].outUs === currentMedia.durationUs
+  );
+}
+
+function changeEditMode(mode) {
+  if (mode === editMode) return;
+  if (currentMedia && hasModeEdits() && !window.confirm("Switching edit modes will reset the sequence. Continue?")) return;
+  editMode = mode;
+  includeModeButton.classList.toggle("active", mode === "include");
+  removeModeButton.classList.toggle("active", mode === "remove");
+  applyRangeButton.textContent = mode === "remove" ? "Remove range" : "Include range";
+  resetHistory();
+  if (currentMedia) resetSequence(false);
+}
+
+function removeSequenceRange(startUs, endUs) {
+  segments = subtractSequenceRange(segments, startUs, endUs);
+}
+
+function applyMarkedRange() {
+  if (!currentMedia || markOutUs <= markInUs) return;
+  recordEdit();
+  if (editMode === "remove") {
+    const removalStartUs = markInUs;
+    removeSequenceRange(markInUs, markOutUs);
+    sequencePlayheadUs = Math.min(removalStartUs, sequenceDurationUs());
+    markInUs = sequencePlayheadUs;
+    markOutUs = sequencePlayheadUs;
+    if (segments.length > 0) setSequencePlayhead(sequencePlayheadUs);
+    else video.pause();
+    notice.textContent = "Range removed and the sequence gap closed.";
+  } else {
+    const overlaps = segments.some((segment) => markInUs < segment.outUs && markOutUs > segment.inUs);
+    if (overlaps) {
+      undoStack.pop();
+      notice.textContent = "Included ranges cannot overlap.";
+      return;
+    }
+    segments.push({ id: crypto.randomUUID(), inUs: markInUs, outUs: markOutUs });
+    segments.sort((left, right) => left.inUs - right.inUs);
+    notice.textContent = "Range included in the sequence.";
+  }
+  renderMarks();
+  renderSegments();
+}
+
+function removeSelectedSegment() {
+  if (!selectedSegmentId) return;
+  recordEdit();
+  segments = segments.filter((segment) => segment.id !== selectedSegmentId);
+  selectedSegmentId = segments[0]?.id ?? null;
+  sequencePlayheadUs = Math.min(sequencePlayheadUs, sequenceDurationUs());
+  if (editMode === "remove" && segments.length > 0) setSequencePlayhead(sequencePlayheadUs);
+  renderMarks();
+  renderSegments();
+}
+
+function undoEdit() {
+  const snapshot = undoStack.pop();
+  if (!snapshot) return;
+  redoStack.push(snapshotEdit());
+  restoreEdit(snapshot);
+}
+
+function redoEdit() {
+  const snapshot = redoStack.pop();
+  if (!snapshot) return;
+  undoStack.push(snapshotEdit());
+  restoreEdit(snapshot);
+}
+
+function setSequencePlayhead(timestampUs) {
+  const mapped = sequenceToSource(timestampUs);
+  if (!mapped) return;
+  sequencePlayheadUs = mapped.sequenceUs;
+  activeSegmentIndex = mapped.index;
+  programmaticSeek = true;
+  video.currentTime = mapped.sourceUs / 1_000_000;
+  playheadTime.value = formatTimeUs(sequencePlayheadUs);
+  drawTimeline();
+}
+
+function seekBySeconds(seconds) {
+  if (!currentMedia) return;
+  if (editMode === "remove") {
+    setSequencePlayhead(sequencePlayheadUs + seconds * 1_000_000);
+  } else {
+    video.currentTime = Math.min(Math.max(video.currentTime + seconds, 0), video.duration || 0);
+  }
+}
+
+function seekKeyframe(direction) {
+  if (!currentMedia) return;
+  const indexValues = sequenceKeyframesUs();
+  if (indexValues.length === 0) return;
+  const currentUs = currentEditTimeUs();
+  let low = 0;
+  let high = indexValues.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (indexValues[middle] < currentUs + (direction > 0 ? 1_000 : -1_000)) low = middle + 1;
+    else high = middle;
+  }
+  const index = direction > 0 ? low : low - 1;
+  if (index < 0 || index >= indexValues.length) return;
+  if (editMode === "remove") setSequencePlayhead(indexValues[index]);
+  else video.currentTime = indexValues[index] / 1_000_000;
+}
+
+async function togglePlayback() {
+  if (!currentMedia || (editMode === "remove" && segments.length === 0)) return;
+  if (video.paused) {
+    if (editMode === "remove") setSequencePlayhead(sequencePlayheadUs >= sequenceDurationUs() ? 0 : sequencePlayheadUs);
+    await video.play();
+  } else video.pause();
+}
+
+function syncRemovePlayback() {
+  if (editMode !== "remove" || segments.length === 0 || programmaticSeek) return;
+  const sourceUs = Math.round(video.currentTime * 1_000_000);
+  const layout = sequenceLayout();
+  const current = layout[activeSegmentIndex];
+  if (!video.paused && current && sourceUs >= current.segment.outUs - 15_000) {
+    const next = layout[activeSegmentIndex + 1];
+    if (next) setSequencePlayhead(next.sequenceInUs);
+    else {
+      sequencePlayheadUs = sequenceDurationUs();
+      video.pause();
+    }
+    return;
+  }
+  const sequenceUs = sourceToSequence(sourceUs);
+  if (sequenceUs !== null) {
+    sequencePlayheadUs = Math.min(sequenceUs, sequenceDurationUs());
+    activeSegmentIndex = layout.findIndex(
+      (item) => sequencePlayheadUs >= item.sequenceInUs && sequencePlayheadUs <= item.sequenceOutUs,
+    );
+    return;
+  }
+  const next = layout.find((item) => item.segment.inUs > sourceUs);
+  if (next) setSequencePlayhead(next.sequenceInUs);
+  else setSequencePlayhead(sequenceDurationUs());
+}
+
+function seekTimeline(clientX) {
+  if (!currentMedia || timelineDurationUs() <= 0) return;
+  const bounds = timeline.getBoundingClientRect();
+  const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
+  const targetUs = ratio * timelineDurationUs();
+  if (editMode === "remove") setSequencePlayhead(targetUs);
+  else video.currentTime = targetUs / 1_000_000;
+}
+
+function updateExportControls() {
   const hasSegments = Boolean(currentMedia && segments.length > 0);
   exportAccurateButton.disabled = !hasSegments;
-  exportFastButton.disabled =
-    !hasSegments || segments.some((segment) => !isKeyframe(segment.inUs));
-  if (!updateMessage) return;
-  if (!hasSegments) exportStatus.value = "Add a keep segment to enable export.";
-  else if (exportFastButton.disabled) {
-    exportStatus.value = "Use frame accurate, or move every in point to a keyframe.";
-  } else {
-    exportStatus.value = "Both export modes are available.";
-  }
+  exportFastButton.disabled = !hasSegments || segments.some((segment) => !isKeyframe(segment.inUs));
+}
+
+function updateControlStates() {
+  const hasMedia = Boolean(currentMedia);
+  document.querySelectorAll('[data-action^="playback."]').forEach((button) => {
+    button.disabled = !hasMedia || (editMode === "remove" && segments.length === 0);
+  });
+  document.querySelectorAll('[data-action="edit.markIn"], [data-action="edit.markOut"]').forEach((button) => {
+    button.disabled = !hasMedia;
+  });
+  document.querySelector('[data-action="edit.undo"]').disabled = undoStack.length === 0;
+  document.querySelector('[data-action="edit.redo"]').disabled = redoStack.length === 0;
+  document.querySelector('[data-action="edit.reset"]').disabled = !hasMedia;
+  saveProjectButton.disabled = !hasMedia;
 }
 
 async function request(url, options) {
   const response = await fetch(url, options);
+  if (response.status === 204) return null;
   const data = await response.json();
   if (!response.ok) throw new Error(data.error ?? "Request failed");
   return data;
 }
 
 async function loadMedia(relativePath, button) {
-  notice.textContent = "Validating media with ffprobe...";
+  notice.textContent = "Validating media and indexing keyframes...";
   if (button) button.disabled = true;
-
   try {
     const media = await request("/api/media", {
       method: "POST",
@@ -198,24 +577,19 @@ async function loadMedia(relativePath, button) {
     const keyframeIndex = await request(media.keyframesUrl);
     currentMedia = media;
     keyframesUs = keyframeIndex.keyframesUs;
-    markInUs = 0;
-    markOutUs = media.durationUs;
-    segments = [];
+    editMode = preferences.defaultEditMode;
+    includeModeButton.classList.toggle("active", editMode === "include");
+    removeModeButton.classList.toggle("active", editMode === "remove");
+    applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
     video.src = media.streamUrl;
     video.load();
     viewerEmpty.hidden = true;
     viewerTitle.textContent = media.name;
     metadata.textContent = `${media.video.width}x${media.video.height} · ${formatDuration(media.durationUs / 1_000_000)} · ${media.video.averageFrameRate?.toFixed(3) ?? "?"} fps · ${formatBytes(media.size)}`;
-    previousKeyframeButton.disabled = keyframesUs.length === 0;
-    nextKeyframeButton.disabled = keyframesUs.length === 0;
-    markInButton.disabled = false;
-    markOutButton.disabled = false;
-    timeline.setAttribute("aria-valuemax", String(media.durationUs));
-    renderMarks();
-    renderSegments();
     currentProjectId = null;
     projectName.value = `${media.name.replace(/\.mp4$/i, "")} edit`;
-    saveProjectButton.disabled = false;
+    resetHistory();
+    resetSequence(false);
     notice.textContent = `Source indexed with ${keyframesUs.length} keyframe${keyframesUs.length === 1 ? "" : "s"}.`;
     return true;
   } catch (error) {
@@ -226,198 +600,9 @@ async function loadMedia(relativePath, button) {
   }
 }
 
-async function refreshProjects() {
-  try {
-    const result = await request("/api/projects");
-    projectList.replaceChildren();
-    if (result.projects.length === 0) {
-      const empty = document.createElement("li");
-      empty.className = "empty-projects";
-      empty.textContent = "No saved projects yet.";
-      projectList.append(empty);
-      return;
-    }
-
-    for (const project of result.projects) {
-      const item = document.createElement("li");
-      const details = document.createElement("div");
-      const name = document.createElement("strong");
-      const summary = document.createElement("span");
-      const button = document.createElement("button");
-      name.textContent = project.name;
-      summary.textContent = `${project.sourceName} · ${project.segmentCount} segment${project.segmentCount === 1 ? "" : "s"}`;
-      details.append(name, summary);
-      button.type = "button";
-      button.textContent = "Open";
-      button.addEventListener("click", () => loadProject(project.id, button));
-      item.append(details, button);
-      projectList.append(item);
-    }
-  } catch (error) {
-    notice.textContent = error.message;
-  }
-}
-
-async function loadProject(projectId, button) {
-  button.disabled = true;
-  notice.textContent = "Opening saved project...";
-  try {
-    const project = await request(`/api/projects/${projectId}`);
-    const loaded = await loadMedia(project.source.relativePath, null);
-    if (!loaded) return;
-    currentProjectId = project.id;
-    projectName.value = project.name;
-    segments = project.segments.map((segment) => ({ ...segment }));
-    renderSegments();
-    notice.textContent = `Opened ${project.name}.`;
-  } catch (error) {
-    notice.textContent = error.message;
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function saveProject() {
-  if (!currentMedia) return null;
-  saveProjectButton.disabled = true;
-  notice.textContent = "Saving edit decision list...";
-  const body = {
-    name: projectName.value,
-    sourceMediaId: currentMedia.id,
-    segments: segments.map(({ id, inUs, outUs }) => ({ id, inUs, outUs })),
-  };
-
-  try {
-    const project = await request(
-      currentProjectId ? `/api/projects/${currentProjectId}` : "/api/projects",
-      {
-        method: currentProjectId ? "PUT" : "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-    currentProjectId = project.id;
-    projectName.value = project.name;
-    notice.textContent = `Saved ${project.name}.`;
-    await refreshProjects();
-    return project;
-  } catch (error) {
-    notice.textContent = error.message;
-    return null;
-  } finally {
-    saveProjectButton.disabled = false;
-  }
-}
-
-async function beginExport(mode) {
-  const buttons = [exportFastButton, exportAccurateButton];
-  buttons.forEach((button) => {
-    button.disabled = true;
-  });
-  exportProgress.value = 0;
-  exportStatus.value = "Saving project before export...";
-
-  try {
-    const project = await saveProject();
-    if (!project) return;
-    const job = await request("/api/exports", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId: project.id, mode }),
-    });
-    exportStatus.value = mode === "fast" ? "Copying source packets..." : "Encoding selected frames...";
-
-    while (true) {
-      await new Promise((resolve) => setTimeout(resolve, 350));
-      const status = await request(`/api/exports/${job.id}`);
-      exportProgress.value = status.progress;
-      if (status.status === "completed") {
-        exportStatus.value = `Exported to ${status.outputPath}`;
-        notice.textContent = `${status.outputName} is ready.`;
-        break;
-      }
-      if (status.status === "failed") throw new Error(status.error);
-    }
-  } catch (error) {
-    exportStatus.value = `Export failed: ${error.message}`;
-    notice.textContent = error.message;
-  } finally {
-    updateExportControls(false);
-  }
-}
-
-function seekKeyframe(direction) {
-  if (!currentMedia || keyframesUs.length === 0) return;
-  const currentUs = Math.round(video.currentTime * 1_000_000);
-  let low = 0;
-  let high = keyframesUs.length;
-
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    if (keyframesUs[middle] < currentUs + (direction > 0 ? 1_000 : -1_000)) low = middle + 1;
-    else high = middle;
-  }
-
-  const index = direction > 0 ? low : low - 1;
-  if (index >= 0 && index < keyframesUs.length) {
-    video.currentTime = keyframesUs[index] / 1_000_000;
-  }
-}
-
-function addSegment() {
-  if (!currentMedia || markOutUs <= markInUs) return;
-  const overlaps = segments.some(
-    (segment) => markInUs < segment.outUs && markOutUs > segment.inUs,
-  );
-  if (overlaps) {
-    notice.textContent = "Keep segments cannot overlap.";
-    return;
-  }
-  segments.push({ id: crypto.randomUUID(), inUs: markInUs, outUs: markOutUs });
-  segments.sort((left, right) => left.inUs - right.inUs);
-  notice.textContent = "Segment added to the edit decision list.";
-  renderSegments();
-}
-
-function seekTimeline(clientX) {
-  if (!currentMedia?.durationUs) return;
-  const bounds = timeline.getBoundingClientRect();
-  const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
-  video.currentTime = (ratio * currentMedia.durationUs) / 1_000_000;
-}
-
-function renderFiles(files) {
-  fileList.replaceChildren();
-  if (files.length === 0) {
-    const empty = document.createElement("li");
-    empty.className = "empty-library";
-    empty.textContent = "No MP4 files found in this media root.";
-    fileList.append(empty);
-    return;
-  }
-
-  for (const file of files) {
-    const item = document.createElement("li");
-    const details = document.createElement("div");
-    const name = document.createElement("strong");
-    const path = document.createElement("span");
-    const button = document.createElement("button");
-
-    name.textContent = file.name;
-    path.textContent = `${file.relativePath} · ${formatBytes(file.size)}`;
-    details.append(name, path);
-    button.type = "button";
-    button.textContent = "Load";
-    button.addEventListener("click", () => loadMedia(file.relativePath, button));
-    item.append(details, button);
-    fileList.append(item);
-  }
-}
-
 async function refreshLibrary() {
   refreshButton.disabled = true;
   notice.textContent = "Scanning for MP4 files...";
-
   try {
     const library = await request("/api/files");
     rootPath.textContent = library.mediaRoot;
@@ -433,36 +618,649 @@ async function refreshLibrary() {
   }
 }
 
-refreshButton.addEventListener("click", refreshLibrary);
-saveProjectButton.addEventListener("click", saveProject);
-exportFastButton.addEventListener("click", () => beginExport("fast"));
-exportAccurateButton.addEventListener("click", () => beginExport("accurate"));
-previousKeyframeButton.addEventListener("click", () => seekKeyframe(-1));
-nextKeyframeButton.addEventListener("click", () => seekKeyframe(1));
-markInButton.addEventListener("click", () => {
-  markInUs = Math.round(video.currentTime * 1_000_000);
-  renderMarks();
+function renderFiles(files) {
+  fileList.replaceChildren();
+  if (files.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty-library";
+    empty.textContent = "No MP4 files found in this media root.";
+    fileList.append(empty);
+    return;
+  }
+  for (const file of files) {
+    const item = document.createElement("li");
+    const details = document.createElement("div");
+    const name = document.createElement("button");
+    const fileSize = document.createElement("span");
+    item.classList.toggle("selected", file.relativePath === selectedMediaPath);
+    name.type = "button";
+    name.className = "file-name-button";
+    name.textContent = file.name;
+    name.title = file.relativePath;
+    name.addEventListener("click", () => {
+      selectedMediaPath = file.relativePath;
+      loadMedia(file.relativePath, name);
+    });
+    fileSize.textContent = formatBytes(file.size);
+    details.append(name, fileSize);
+    item.append(details);
+    fileList.append(item);
+  }
+}
+
+async function refreshProjects() {
+  try {
+    const result = await request("/api/projects");
+    renderProjects(result.projects);
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
+function renderProjects(projects) {
+  projectList.replaceChildren();
+  if (projects.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty-projects";
+    empty.textContent = "No saved projects yet.";
+    projectList.append(empty);
+    return;
+  }
+  for (const project of projects) {
+    const item = document.createElement("li");
+    const details = document.createElement("div");
+    const name = document.createElement("strong");
+    const actions = document.createElement("div");
+    const openButton = makeIconButton(`Open ${project.name}`, ICON_PATHS.open);
+    const exportButton = makeIconButton(`Download ${project.name} as JSON`, ICON_PATHS.download);
+    const deleteButton = makeIconButton(`Delete ${project.name}`, ICON_PATHS.delete);
+    item.classList.toggle("selected", project.id === selectedProjectId);
+    item.addEventListener("click", () => {
+      selectedProjectId = project.id;
+      renderProjects(projects);
+    });
+    name.textContent = project.name;
+    name.title = project.name;
+    details.append(name);
+    actions.className = "project-item-actions";
+    openButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectedProjectId = project.id;
+      loadProject(project.id, openButton);
+    });
+    exportButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectedProjectId = project.id;
+      downloadProject(project.id);
+    });
+    deleteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectedProjectId = project.id;
+      deleteProject(project.id, project.name);
+    });
+    actions.append(openButton, exportButton, deleteButton);
+    item.append(details, actions);
+    projectList.append(item);
+  }
+}
+
+async function importProject(file) {
+  if (!file) return;
+  importProjectButton.disabled = true;
+  notice.textContent = `Importing ${file.name}...`;
+  try {
+    const document = JSON.parse(await file.text());
+    const project = await request("/api/projects/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(document),
+    });
+    selectedProjectId = project.id;
+    await refreshProjects();
+    notice.textContent = `${project.name} imported.`;
+  } catch (error) {
+    notice.textContent = error instanceof SyntaxError ? "Project file is not valid JSON." : error.message;
+  } finally {
+    importProjectButton.disabled = false;
+    projectFileInput.value = "";
+  }
+}
+
+function downloadProject(projectId = selectedProjectId) {
+  if (!projectId) return;
+  const link = document.createElement("a");
+  link.href = `/api/projects/${projectId}/export`;
+  link.download = "";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+async function deleteProject(projectId = selectedProjectId, name = "this project") {
+  if (!projectId || !window.confirm(`Delete ${name}? The source video and rendered exports will not be removed.`)) return;
+  try {
+    await request(`/api/projects/${projectId}`, { method: "DELETE" });
+    if (currentProjectId === projectId) currentProjectId = null;
+    if (selectedProjectId === projectId) selectedProjectId = null;
+    notice.textContent = `${name} deleted.`;
+    await refreshProjects();
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
+async function loadProject(projectId, button) {
+  if (button) button.disabled = true;
+  notice.textContent = "Opening saved project...";
+  try {
+    const project = await request(`/api/projects/${projectId}`);
+    const loaded = await loadMedia(project.source.relativePath, null);
+    if (!loaded) return;
+    currentProjectId = project.id;
+    selectedProjectId = project.id;
+    projectName.value = project.name;
+    editMode = project.editMode ?? "include";
+    includeModeButton.classList.toggle("active", editMode === "include");
+    removeModeButton.classList.toggle("active", editMode === "remove");
+    applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
+    segments = project.segments.map((segment) => ({ ...segment }));
+    selectedSegmentId = segments[0]?.id ?? null;
+    sequencePlayheadUs = 0;
+    markInUs = 0;
+    markOutUs = timelineDurationUs();
+    resetHistory();
+    if (editMode === "remove" && segments.length > 0) setSequencePlayhead(0);
+    renderMarks();
+    renderSegments();
+    notice.textContent = `Opened ${project.name}.`;
+  } catch (error) {
+    notice.textContent = error.message;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function saveProject() {
+  if (!currentMedia) return null;
+  saveProjectButton.disabled = true;
+  notice.textContent = "Saving edit decision list...";
+  try {
+    const project = await request(currentProjectId ? `/api/projects/${currentProjectId}` : "/api/projects", {
+      method: currentProjectId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: projectName.value,
+        editMode,
+        sourceMediaId: currentMedia.id,
+        segments: segments.map(({ id, inUs, outUs }) => ({ id, inUs, outUs })),
+      }),
+    });
+    currentProjectId = project.id;
+    selectedProjectId = project.id;
+    projectName.value = project.name;
+    notice.textContent = `Saved ${project.name}.`;
+    await refreshProjects();
+    return project;
+  } catch (error) {
+    notice.textContent = error.message;
+    return null;
+  } finally {
+    saveProjectButton.disabled = false;
+  }
+}
+
+async function beginExport(mode) {
+  exportFastButton.disabled = true;
+  exportAccurateButton.disabled = true;
+  notice.textContent = "Saving project before export...";
+  try {
+    const project = await saveProject();
+    if (!project) return;
+    const job = await request("/api/exports", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: project.id, mode }),
+    });
+    selectedExportJobId = job.id;
+    activatePanelTab("exports");
+    if (preferences.sidebarCollapsed) {
+      preferences.sidebarCollapsed = false;
+      applySidebarPreference();
+      persistPreferences().catch((error) => { notice.textContent = error.message; });
+    }
+    notice.textContent = `${project.name} added paused. Resume it from the export queue.`;
+    await refreshExportQueue();
+  } catch (error) {
+    notice.textContent = error.message;
+  } finally {
+    updateExportControls();
+  }
+}
+
+function renderExportQueue(jobs) {
+  exportQueueList.replaceChildren();
+  clearExportQueueButton.disabled = jobs.length === 0;
+  const activeJobs = jobs.filter((job) => ["queued", "running", "paused", "stopping"].includes(job.status));
+  exportQueueSummary.value = activeJobs.length === 0
+    ? jobs.length === 0 ? "Queue empty" : "No active jobs"
+    : `${activeJobs.length} active job${activeJobs.length === 1 ? "" : "s"}`;
+
+  if (jobs.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty-queue";
+    empty.textContent = "New exports appear here paused and remain after server restarts.";
+    exportQueueList.append(empty);
+    return;
+  }
+
+  for (const job of jobs) {
+    const item = document.createElement("li");
+    const header = document.createElement("div");
+    const details = document.createElement("div");
+    const title = document.createElement("strong");
+    const metadata = document.createElement("span");
+    const status = document.createElement("span");
+    const progress = document.createElement("progress");
+    const actions = document.createElement("div");
+    item.classList.toggle("selected", job.id === selectedExportJobId);
+    item.addEventListener("click", () => {
+      selectedExportJobId = job.id;
+      renderExportQueue(jobs);
+    });
+    header.className = "export-job-header";
+    details.className = "export-job-details";
+    title.textContent = job.outputName;
+    title.title = job.outputPath;
+    metadata.textContent = `${job.projectName} · ${job.mode}`;
+    status.className = `export-job-status status-${job.status}`;
+    status.textContent = job.status;
+    details.append(title, metadata);
+    header.append(details, status);
+    progress.max = 1;
+    progress.value = job.progress;
+    progress.setAttribute("aria-label", `${job.outputName} progress`);
+    actions.className = "export-job-actions";
+
+    if (job.status === "running" || job.status === "queued") {
+      const pauseButton = document.createElement("button");
+      pauseButton.type = "button";
+      pauseButton.textContent = "Pause";
+      pauseButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        controlExport(job.id, "pause");
+      });
+      actions.append(pauseButton);
+    }
+    if (job.status === "paused") {
+      const resumeButton = document.createElement("button");
+      resumeButton.type = "button";
+      resumeButton.textContent = "Resume";
+      resumeButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        controlExport(job.id, "resume");
+      });
+      actions.append(resumeButton);
+    }
+    if (["queued", "running", "paused"].includes(job.status)) {
+      const stopButton = document.createElement("button");
+      stopButton.type = "button";
+      stopButton.textContent = "Stop";
+      stopButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        controlExport(job.id, "stop");
+      });
+      actions.append(stopButton);
+    }
+    if (job.status === "completed") {
+      item.title = job.outputPath;
+    } else if (job.status === "failed") {
+      const error = document.createElement("span");
+      error.className = "export-job-error";
+      error.textContent = job.error;
+      actions.append(error);
+    }
+    item.append(header, progress);
+    if (actions.childElementCount > 0) item.append(actions);
+    exportQueueList.append(item);
+  }
+}
+
+async function refreshExportQueue() {
+  try {
+    const result = await request("/api/exports");
+    renderExportQueue(result.jobs);
+  } catch (error) {
+    exportQueueSummary.value = "Queue unavailable";
+  }
+}
+
+async function controlExport(jobId = selectedExportJobId, action) {
+  if (!jobId) return;
+  if (action === "stop" && !window.confirm("Stop this export? Partial output and temporary files will be removed.")) return;
+  try {
+    const job = await request(`/api/exports/${jobId}/${action}`, { method: "POST" });
+    selectedExportJobId = job.id;
+    await refreshExportQueue();
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
+async function clearExportQueue() {
+  if (!window.confirm("Clear the export queue? Active exports will stop, but completed files will remain on disk.")) return;
+  try {
+    await request("/api/exports", { method: "DELETE" });
+    selectedExportJobId = null;
+    await refreshExportQueue();
+    notice.textContent = "Export queue cleared. Completed files were not deleted.";
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
+function activatePanelTab(name) {
+  for (const tab of panelTabs) {
+    const selected = tab.dataset.panelTab === name;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  for (const content of panelContents) content.hidden = content.dataset.panelContent !== name;
+}
+
+function setPanelWidth(width) {
+  const maximum = Math.floor(appLayout.clientWidth * 0.4);
+  const minimum = Math.min(280, maximum);
+  appLayout.style.setProperty("--right-panel-width", `${Math.max(minimum, Math.min(maximum, width))}px`);
+}
+
+function beginPanelResize(event) {
+  if (window.matchMedia("(max-width: 820px)").matches) return;
+  event.preventDefault();
+  panelResizer.setPointerCapture(event.pointerId);
+  const resize = (moveEvent) => setPanelWidth(appLayout.getBoundingClientRect().right - moveEvent.clientX);
+  const finish = () => {
+    panelResizer.removeEventListener("pointermove", resize);
+    panelResizer.removeEventListener("pointerup", finish);
+    panelResizer.removeEventListener("pointercancel", finish);
+  };
+  panelResizer.addEventListener("pointermove", resize);
+  panelResizer.addEventListener("pointerup", finish);
+  panelResizer.addEventListener("pointercancel", finish);
+}
+
+function applySidebarPreference() {
+  const collapsed = preferences.sidebarCollapsed;
+  libraryPanel.hidden = collapsed;
+  appLayout.classList.toggle("sidebar-collapsed", collapsed);
+  toggleSidebarButton.setAttribute("aria-expanded", String(!collapsed));
+}
+
+async function persistPreferences(nextPreferences = preferences) {
+  preferences = await request("/api/preferences", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(nextPreferences),
+  });
+  applySidebarPreference();
+}
+
+function toggleSidebar() {
+  preferences.sidebarCollapsed = !preferences.sidebarCollapsed;
+  applySidebarPreference();
+  persistPreferences().catch((error) => {
+    notice.textContent = error.message;
+  });
+}
+
+function displayShortcut(shortcut) {
+  if (!shortcut) return "Unassigned";
+  return shortcut
+    .replace("Mod", navigator.platform.includes("Mac") ? "Cmd" : "Ctrl")
+    .replace("Key", "")
+    .replace("Digit", "")
+    .replace("Arrow", "")
+    .replace("BracketLeft", "[")
+    .replace("BracketRight", "]")
+    .replace("Comma", ",")
+    .replace("Period", ".")
+    .split("+")
+    .join(" + ");
+}
+
+function renderShortcutEditor() {
+  shortcutList.replaceChildren();
+  for (const action of ACTIONS) {
+    const row = document.createElement("div");
+    const label = document.createElement("span");
+    const binding = document.createElement("button");
+    const clear = document.createElement("button");
+    row.className = "shortcut-row";
+    label.textContent = `${action.group} / ${action.label}`;
+    binding.type = "button";
+    binding.textContent = capturingActionId === action.id ? "Press keys..." : displayShortcut(preferencesDraft.shortcuts[action.id]);
+    binding.classList.toggle("capturing", capturingActionId === action.id);
+    binding.addEventListener("click", () => {
+      capturingActionId = action.id;
+      preferencesMessage.textContent = `Recording shortcut for ${action.label}. Press Escape to cancel.`;
+      renderShortcutEditor();
+    });
+    clear.type = "button";
+    clear.textContent = "Clear";
+    clear.addEventListener("click", () => {
+      preferencesDraft.shortcuts[action.id] = null;
+      renderShortcutEditor();
+    });
+    row.append(label, binding, clear);
+    shortcutList.append(row);
+  }
+}
+
+function openPreferences() {
+  preferencesDraft = structuredClone(preferences);
+  defaultEditModeSelect.value = preferencesDraft.defaultEditMode;
+  libraryPathInput.value = preferencesDraft.libraryPath;
+  exportPathInput.value = preferencesDraft.exportPath;
+  capturingActionId = null;
+  preferencesMessage.textContent = "";
+  renderShortcutEditor();
+  preferencesDialog.showModal();
+}
+
+async function savePreferences() {
+  if (savingPreferences) return false;
+  savingPreferences = true;
+  preferencesDraft.defaultEditMode = defaultEditModeSelect.value;
+  preferencesDraft.libraryPath = libraryPathInput.value;
+  preferencesDraft.exportPath = exportPathInput.value;
+  try {
+    await persistPreferences(preferencesDraft);
+    await refreshLibrary();
+    notice.textContent = "Preferences saved and paths reloaded.";
+    return true;
+  } catch (error) {
+    preferencesMessage.textContent = error.message;
+    return false;
+  } finally {
+    savingPreferences = false;
+  }
+}
+
+async function saveAndClosePreferences() {
+  if (await savePreferences()) preferencesDialog.close("saved");
+}
+
+const ACTIONS = [
+  { id: "ui.toggleSidebar", label: "Toggle right panel", group: "Interface", run: toggleSidebar },
+  { id: "ui.openPreferences", label: "Open preferences", group: "Interface", run: openPreferences },
+  { id: "library.refresh", label: "Refresh library", group: "Library", run: refreshLibrary },
+  { id: "library.loadSelected", label: "Load selected media", group: "Library", run: () => selectedMediaPath && loadMedia(selectedMediaPath) },
+  { id: "project.openSelected", label: "Open selected project", group: "Project", run: () => selectedProjectId && loadProject(selectedProjectId) },
+  { id: "project.save", label: "Save project", group: "Project", run: saveProject },
+  { id: "project.exportSelected", label: "Export selected project as JSON", group: "Project", run: () => downloadProject() },
+  { id: "project.deleteSelected", label: "Delete selected project", group: "Project", run: () => deleteProject() },
+  { id: "playback.toggle", label: "Play or pause", group: "Playback", run: togglePlayback },
+  { id: "playback.previousKeyframe", label: "Previous keyframe", group: "Playback", run: () => seekKeyframe(-1), repeatable: true },
+  { id: "playback.nextKeyframe", label: "Next keyframe", group: "Playback", run: () => seekKeyframe(1), repeatable: true },
+  ...[1, 3, 6, 10].flatMap((seconds) => [
+    { id: `playback.backward${seconds}`, label: `Backward ${seconds} seconds`, group: "Playback", run: () => seekBySeconds(-seconds), repeatable: true },
+    { id: `playback.forward${seconds}`, label: `Forward ${seconds} seconds`, group: "Playback", run: () => seekBySeconds(seconds), repeatable: true },
+  ]),
+  { id: "edit.modeInclude", label: "Switch to Include mode", group: "Edit", run: () => changeEditMode("include") },
+  { id: "edit.modeRemove", label: "Switch to Remove mode", group: "Edit", run: () => changeEditMode("remove") },
+  { id: "edit.markIn", label: "Mark in", group: "Edit", run: () => { markInUs = currentEditTimeUs(); renderMarks(); } },
+  { id: "edit.markOut", label: "Mark out", group: "Edit", run: () => { markOutUs = currentEditTimeUs(); renderMarks(); } },
+  { id: "edit.applyRange", label: "Apply marked range", group: "Edit", run: applyMarkedRange },
+  { id: "edit.removeSelected", label: "Remove selected clip", group: "Edit", run: removeSelectedSegment },
+  { id: "edit.undo", label: "Undo", group: "Edit", run: undoEdit },
+  { id: "edit.redo", label: "Redo", group: "Edit", run: redoEdit },
+  { id: "edit.reset", label: "Reset sequence", group: "Edit", run: () => resetSequence(true) },
+  { id: "export.fast", label: "Fast export", group: "Export", run: () => beginExport("fast") },
+  { id: "export.accurate", label: "Frame-accurate export", group: "Export", run: () => beginExport("accurate") },
+  { id: "export.pauseSelected", label: "Pause selected export", group: "Export", run: () => controlExport(selectedExportJobId, "pause") },
+  { id: "export.resumeSelected", label: "Resume selected export", group: "Export", run: () => controlExport(selectedExportJobId, "resume") },
+  { id: "export.stopSelected", label: "Stop selected export", group: "Export", run: () => controlExport(selectedExportJobId, "stop") },
+];
+const ACTION_MAP = new Map(ACTIONS.map((action) => [action.id, action]));
+
+function executeAction(actionId) {
+  ACTION_MAP.get(actionId)?.run();
+}
+
+document.querySelectorAll("[data-action]").forEach((button) => {
+  button.addEventListener("click", () => executeAction(button.dataset.action));
 });
-markOutButton.addEventListener("click", () => {
-  markOutUs = Math.round(video.currentTime * 1_000_000);
-  renderMarks();
+toggleSidebarButton.addEventListener("click", () => executeAction("ui.toggleSidebar"));
+openPreferencesButton.addEventListener("click", () => executeAction("ui.openPreferences"));
+refreshButton.addEventListener("click", () => executeAction("library.refresh"));
+saveProjectButton.addEventListener("click", () => executeAction("project.save"));
+importProjectButton.addEventListener("click", () => projectFileInput.click());
+projectFileInput.addEventListener("change", () => importProject(projectFileInput.files[0]));
+exportFastButton.addEventListener("click", () => executeAction("export.fast"));
+exportAccurateButton.addEventListener("click", () => executeAction("export.accurate"));
+clearExportQueueButton.addEventListener("click", clearExportQueue);
+includeModeButton.addEventListener("click", () => executeAction("edit.modeInclude"));
+removeModeButton.addEventListener("click", () => executeAction("edit.modeRemove"));
+for (const tab of panelTabs) {
+  tab.addEventListener("click", () => activatePanelTab(tab.dataset.panelTab));
+  tab.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const offset = event.key === "ArrowRight" ? 1 : -1;
+    const next = panelTabs[(panelTabs.indexOf(tab) + offset + panelTabs.length) % panelTabs.length];
+    activatePanelTab(next.dataset.panelTab);
+    next.focus();
+  });
+}
+panelResizer.addEventListener("pointerdown", beginPanelResize);
+panelResizer.addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  const currentWidth = libraryPanel.getBoundingClientRect().width;
+  setPanelWidth(currentWidth + (event.key === "ArrowLeft" ? 20 : -20));
 });
-addSegmentButton.addEventListener("click", addSegment);
+resetShortcutsButton.addEventListener("click", () => {
+  preferencesDraft.shortcuts = structuredClone(DEFAULT_PREFERENCES.shortcuts);
+  preferencesMessage.textContent = "Default shortcuts restored. Press Enter or close Preferences to apply them.";
+  renderShortcutEditor();
+});
+preferencesForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveAndClosePreferences();
+});
+preferencesForm.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || capturingActionId || !event.target.matches("input, select")) return;
+  event.preventDefault();
+  saveAndClosePreferences();
+});
+closePreferencesButton.addEventListener("click", saveAndClosePreferences);
+preferencesDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  saveAndClosePreferences();
+});
 timeline.addEventListener("pointerdown", (event) => seekTimeline(event.clientX));
 timeline.addEventListener("keydown", (event) => {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
   event.preventDefault();
   seekKeyframe(event.key === "ArrowLeft" ? -1 : 1);
 });
+preferencesDialog.addEventListener("close", () => {
+  capturingActionId = null;
+});
+
+document.addEventListener("keydown", (event) => {
+  if (capturingActionId) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      capturingActionId = null;
+      preferencesMessage.textContent = "Shortcut recording cancelled.";
+      renderShortcutEditor();
+      return;
+    }
+    const shortcut = normalizeShortcutEvent(event);
+    if (!shortcut) return;
+    const conflict = Object.entries(preferencesDraft.shortcuts).find(
+      ([actionId, candidate]) => actionId !== capturingActionId && candidate === shortcut,
+    );
+    if (conflict) {
+      preferencesMessage.textContent = `${displayShortcut(shortcut)} is already assigned to ${ACTION_MAP.get(conflict[0])?.label ?? conflict[0]}.`;
+      return;
+    }
+    preferencesDraft.shortcuts[capturingActionId] = shortcut;
+    capturingActionId = null;
+    preferencesMessage.textContent = "Shortcut updated. Press Enter or close Preferences to apply it.";
+    renderShortcutEditor();
+    return;
+  }
+
+  if (preferencesDialog.open || event.target.closest("input, select, textarea, [contenteditable='true']")) return;
+  const shortcut = normalizeShortcutEvent(event);
+  const actionId = findShortcutAction(preferences.shortcuts, shortcut);
+  const action = ACTION_MAP.get(actionId);
+  if (!action || (event.repeat && !action.repeatable)) return;
+  event.preventDefault();
+  executeAction(action.id);
+});
+
 video.addEventListener("timeupdate", () => {
-  playheadTime.value = formatTimeUs(video.currentTime * 1_000_000);
-  timeline.setAttribute("aria-valuenow", String(Math.round(video.currentTime * 1_000_000)));
+  syncRemovePlayback();
+  const displayUs = currentEditTimeUs();
+  playheadTime.value = formatTimeUs(displayUs);
+  timeline.setAttribute("aria-valuenow", String(Math.round(displayUs)));
   drawTimeline();
+});
+video.addEventListener("seeked", () => {
+  programmaticSeek = false;
+  syncRemovePlayback();
+});
+video.addEventListener("play", () => {
+  if (editMode === "remove") setSequencePlayhead(sequencePlayheadUs);
 });
 video.addEventListener("error", () => {
   notice.textContent = "The browser could not decode this video.";
 });
-
 new ResizeObserver(drawTimeline).observe(timeline);
 
-Promise.all([refreshLibrary(), refreshProjects()]);
+async function initialize() {
+  try {
+    const savedPreferences = await request("/api/preferences");
+    preferences = {
+      ...structuredClone(DEFAULT_PREFERENCES),
+      ...savedPreferences,
+      shortcuts: { ...DEFAULT_PREFERENCES.shortcuts, ...savedPreferences.shortcuts },
+    };
+  } catch (error) {
+    notice.textContent = `Using default preferences: ${error.message}`;
+  }
+  editMode = preferences.defaultEditMode;
+  activatePanelTab("library");
+  applySidebarPreference();
+  includeModeButton.classList.toggle("active", editMode === "include");
+  removeModeButton.classList.toggle("active", editMode === "remove");
+  applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
+  updateControlStates();
+  await Promise.all([refreshLibrary(), refreshProjects(), refreshExportQueue()]);
+  window.setInterval(refreshExportQueue, 750);
+}
+
+initialize();

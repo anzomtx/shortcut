@@ -13,10 +13,14 @@
         <p class="eyebrow">Local video workspace</p>
         <h1>Shortcut</h1>
       </div>
-      <div class="status" id="server-status">Connecting</div>
+      <div class="masthead-actions">
+        <div class="status" id="server-status">Connecting</div>
+        <button type="button" id="toggle-sidebar" aria-expanded="false" aria-controls="library-panel">Right panel</button>
+        <button type="button" id="open-preferences">Preferences</button>
+      </div>
     </header>
 
-    <main>
+    <main id="app-layout" class="sidebar-collapsed">
       <section class="viewer-panel" aria-labelledby="viewer-title">
         <div class="section-heading">
           <div>
@@ -27,48 +31,74 @@
         </div>
 
         <div class="viewer-shell">
-          <video id="video" controls preload="metadata"></video>
+          <video id="video" preload="metadata" playsinline></video>
           <div class="viewer-empty" id="viewer-empty">
             <span>MP4</span>
             <p>Your source remains on disk. Playback is streamed in byte ranges.</p>
           </div>
         </div>
-        <div class="transport" aria-label="Keyframe navigation">
-          <button type="button" id="previous-keyframe" disabled>Previous keyframe</button>
-          <output id="playhead-time">00:00:00.000</output>
-          <button type="button" id="next-keyframe" disabled>Next keyframe</button>
-        </div>
 
-        <section class="edit-panel" aria-labelledby="edit-title">
-          <div class="edit-heading">
-            <div>
-              <p class="step">02 / Edit decision list</p>
-              <h2 id="edit-title">Keep segments</h2>
+        <canvas
+          id="timeline"
+          class="timeline"
+          height="76"
+          tabindex="0"
+          role="slider"
+          aria-label="Sequence timeline"
+          aria-valuemin="0"
+          aria-valuemax="0"
+          aria-valuenow="0"
+        ></canvas>
+
+        <details class="tool-drawer controls-drawer">
+          <summary>
+            <span>Playback and edit controls</span>
+            <output id="playhead-time">00:00:00.000</output>
+          </summary>
+          <div class="tool-drawer-content">
+            <div class="transport" aria-label="Playback navigation">
+              <button type="button" data-action="playback.previousKeyframe" disabled>Previous keyframe</button>
+              <button type="button" data-action="playback.toggle" disabled>Play / pause</button>
+              <button type="button" data-action="playback.nextKeyframe" disabled>Next keyframe</button>
             </div>
+            <div class="seek-controls" aria-label="Fixed time navigation">
+              <button type="button" data-action="playback.backward10" disabled>-10s</button>
+              <button type="button" data-action="playback.backward6" disabled>-6s</button>
+              <button type="button" data-action="playback.backward3" disabled>-3s</button>
+              <button type="button" data-action="playback.backward1" disabled>-1s</button>
+              <button type="button" data-action="playback.forward1" disabled>+1s</button>
+              <button type="button" data-action="playback.forward3" disabled>+3s</button>
+              <button type="button" data-action="playback.forward6" disabled>+6s</button>
+              <button type="button" data-action="playback.forward10" disabled>+10s</button>
+            </div>
+            <div class="mark-controls">
+              <button type="button" data-action="edit.markIn" disabled>Mark in</button>
+              <output id="in-point">In 00:00:00.000</output>
+              <button type="button" id="apply-range" data-action="edit.applyRange" disabled>Remove range</button>
+              <output id="out-point">Out 00:00:00.000</output>
+              <button type="button" data-action="edit.markOut" disabled>Mark out</button>
+            </div>
+            <div class="history-controls">
+              <button type="button" data-action="edit.undo" disabled>Undo</button>
+              <button type="button" data-action="edit.redo" disabled>Redo</button>
+              <button type="button" data-action="edit.reset" disabled>Reset sequence</button>
+            </div>
+          </div>
+        </details>
+
+        <details class="tool-drawer edl-drawer">
+          <summary>
+            <span id="edit-title">Edit decision list</span>
             <output id="edited-duration">Edited duration 00:00:00.000</output>
+          </summary>
+          <div class="tool-drawer-content">
+            <div class="mode-switch" aria-label="Editing mode">
+              <button type="button" id="include-mode">Include</button>
+              <button type="button" id="remove-mode">Remove</button>
+            </div>
+            <ol class="segment-list" id="segment-list"></ol>
           </div>
-
-          <canvas
-            id="timeline"
-            class="timeline"
-            height="76"
-            tabindex="0"
-            role="slider"
-            aria-label="Source timeline"
-            aria-valuemin="0"
-            aria-valuemax="0"
-            aria-valuenow="0"
-          ></canvas>
-
-          <div class="mark-controls">
-            <button type="button" id="mark-in" disabled>Mark in</button>
-            <output id="in-point">In 00:00:00.000</output>
-            <button type="button" id="add-segment" disabled>Add segment</button>
-            <output id="out-point">Out 00:00:00.000</output>
-            <button type="button" id="mark-out" disabled>Mark out</button>
-          </div>
-          <ol class="segment-list" id="segment-list"></ol>
-        </section>
+        </details>
 
         <section class="export-panel" aria-labelledby="export-title">
           <div>
@@ -79,39 +109,105 @@
             <button type="button" id="export-fast" disabled>Fast / no re-encode</button>
             <button type="button" id="export-accurate" disabled>Frame accurate</button>
           </div>
-          <progress id="export-progress" max="1" value="0"></progress>
-          <output id="export-status">Add a keep segment to enable export.</output>
         </section>
       </section>
 
-      <aside class="library-panel" aria-labelledby="library-title">
-        <div class="section-heading library-heading">
-          <div>
-            <p class="step">Media root</p>
-            <h2 id="library-title">Local library</h2>
-          </div>
-          <button type="button" id="refresh-button">Refresh</button>
+      <aside class="library-panel" id="library-panel" aria-label="Workspace panel" hidden>
+        <div class="panel-resizer" id="panel-resizer" role="separator" aria-label="Resize right panel" aria-orientation="vertical" tabindex="0"></div>
+        <div class="panel-tabs" role="tablist" aria-label="Workspace panel">
+          <button type="button" role="tab" id="library-tab" aria-controls="library-tab-panel" aria-selected="true" data-panel-tab="library">Library</button>
+          <button type="button" role="tab" id="projects-tab" aria-controls="projects-tab-panel" aria-selected="false" data-panel-tab="projects">Projects</button>
+          <button type="button" role="tab" id="exports-tab" aria-controls="exports-tab-panel" aria-selected="false" data-panel-tab="exports">Export queue</button>
         </div>
-        <p class="root-path" id="root-path"></p>
-        <div class="notice" id="notice" role="status"></div>
-        <ul class="file-list" id="file-list"></ul>
 
-        <section class="project-panel" aria-labelledby="projects-title">
-          <div class="project-title-row">
+        <section class="panel-tab-content" id="library-tab-panel" role="tabpanel" aria-labelledby="library-tab" data-panel-content="library">
+          <div class="panel-section-heading">
+            <div>
+              <p class="step">Media root</p>
+              <h2 id="library-title">Local library</h2>
+            </div>
+            <button type="button" id="refresh-button">Refresh</button>
+          </div>
+          <p class="root-path" id="root-path"></p>
+          <ul class="file-list bounded-list" id="file-list"></ul>
+        </section>
+
+        <section class="panel-tab-content" id="projects-tab-panel" role="tabpanel" aria-labelledby="projects-tab" data-panel-content="projects" hidden>
+          <div class="panel-section-heading">
             <div>
               <p class="step">Project file</p>
               <h2 id="projects-title">Saved edits</h2>
             </div>
+            <button type="button" id="import-project">Import JSON</button>
+            <input type="file" id="project-file-input" accept="application/json,.json" hidden />
           </div>
           <div class="project-form">
             <label for="project-name">Project name</label>
             <input id="project-name" maxlength="100" value="Untitled edit" />
             <button type="button" id="save-project" disabled>Save project</button>
           </div>
-          <ul class="project-list" id="project-list"></ul>
+          <ul class="project-list bounded-list" id="project-list"></ul>
         </section>
+
+        <section class="panel-tab-content" id="exports-tab-panel" role="tabpanel" aria-labelledby="exports-tab" data-panel-content="exports" hidden>
+          <div class="panel-section-heading">
+            <div>
+              <p class="step">Single worker</p>
+              <h2>Export queue</h2>
+              <output id="export-queue-summary">Queue empty</output>
+            </div>
+            <button type="button" id="clear-export-queue">Clear</button>
+          </div>
+          <ol class="export-queue-list bounded-list" id="export-queue-list"></ol>
+        </section>
+
+        <div class="notice" id="notice" role="status"></div>
       </aside>
     </main>
+
+    <dialog id="preferences-dialog" class="preferences-dialog">
+      <form class="preferences-card" id="preferences-form">
+        <div class="preferences-heading">
+          <div>
+            <p class="eyebrow">Application settings</p>
+            <h2>Preferences</h2>
+          </div>
+          <button type="button" id="close-preferences" aria-label="Close preferences">Close</button>
+        </div>
+
+        <label class="preference-field" for="default-edit-mode">
+          <span>Default editing mode</span>
+          <select id="default-edit-mode">
+            <option value="remove">Remove ranges</option>
+            <option value="include">Include ranges</option>
+          </select>
+        </label>
+
+        <label class="preference-field path-preference" for="library-path">
+          <span>Library path</span>
+          <input id="library-path" type="text" autocomplete="off" spellcheck="false" />
+        </label>
+
+        <label class="preference-field path-preference" for="export-path">
+          <span>Export path</span>
+          <input id="export-path" type="text" autocomplete="off" spellcheck="false" />
+        </label>
+
+        <section class="shortcut-section" aria-labelledby="shortcuts-title">
+          <div>
+            <p class="step">Input map</p>
+            <h3 id="shortcuts-title">Keyboard shortcuts</h3>
+          </div>
+          <p>Choose a binding, then press the desired key combination. Unassigned actions remain available from the interface.</p>
+          <div id="shortcut-list" class="shortcut-list"></div>
+        </section>
+
+        <div class="preferences-message" id="preferences-message" role="status"></div>
+        <div class="preferences-actions">
+          <button type="button" id="reset-shortcuts">Reset defaults</button>
+        </div>
+      </form>
+    </dialog>
 
     <script type="module" src="/app.js"></script>
   </body>

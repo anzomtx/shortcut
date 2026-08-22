@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -147,6 +147,7 @@ test("persists and updates project edit decision lists", async () => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       name: "Test cut",
+      editMode: "remove",
       sourceMediaId: media.id,
       segments: [{ inUs: 0, outUs: 500_000 }],
     }),
@@ -155,7 +156,15 @@ test("persists and updates project edit decision lists", async () => {
   const project = await createResponse.json();
   savedProject = project;
   assert.equal(project.source.relativePath, "sample.mp4");
+  assert.equal(project.editMode, "remove");
   assert.equal(project.segments.length, 1);
+
+  const exportResponse = await fetch(`${baseUrl}/api/projects/${project.id}/export`);
+  assert.equal(exportResponse.status, 200);
+  assert.match(exportResponse.headers.get("content-disposition"), /attachment; filename="test-cut\.json"/);
+  const exportedProject = await exportResponse.json();
+  assert.equal(exportedProject.format, "shortcut-project");
+  assert.equal(exportedProject.project.id, project.id);
 
   const listResponse = await fetch(`${baseUrl}/api/projects`);
   const projectList = await listResponse.json();
@@ -166,6 +175,7 @@ test("persists and updates project edit decision lists", async () => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       name: "Updated cut",
+      editMode: "remove",
       sourceMediaId: media.id,
       segments: [{ inUs: 0, outUs: 750_000 }],
     }),
@@ -175,6 +185,87 @@ test("persists and updates project edit decision lists", async () => {
   assert.equal(updatedProject.name, "Updated cut");
   assert.equal(updatedProject.segments[0].outUs, 750_000);
   savedProject = updatedProject;
+});
+
+test("deletes a saved project", async () => {
+  const media = registeredMedia ?? (await registerSample());
+  const createResponse = await fetch(`${baseUrl}/api/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: "Disposable cut",
+      editMode: "include",
+      sourceMediaId: media.id,
+      segments: [],
+    }),
+  });
+  const project = await createResponse.json();
+  const deleteResponse = await fetch(`${baseUrl}/api/projects/${project.id}`, { method: "DELETE" });
+  assert.equal(deleteResponse.status, 204);
+  const getResponse = await fetch(`${baseUrl}/api/projects/${project.id}`);
+  assert.equal(getResponse.status, 404);
+});
+
+test("imports an exported project document as a new project", async () => {
+  const exportResponse = await fetch(`${baseUrl}/api/projects/${savedProject.id}/export`);
+  const document = await exportResponse.json();
+  const importResponse = await fetch(`${baseUrl}/api/projects/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(document),
+  });
+  assert.equal(importResponse.status, 201);
+  const imported = await importResponse.json();
+  assert.notEqual(imported.id, savedProject.id);
+  assert.equal(imported.name, savedProject.name);
+  assert.equal(imported.source.relativePath, "sample.mp4");
+  assert.deepEqual(imported.segments, savedProject.segments);
+});
+
+test("persists validated application preferences", async () => {
+  const defaultsResponse = await fetch(`${baseUrl}/api/preferences`);
+  assert.equal(defaultsResponse.status, 200);
+  const defaults = await defaultsResponse.json();
+  assert.equal(defaults.sidebarCollapsed, true);
+  assert.equal(defaults.defaultEditMode, "remove");
+  assert.equal(defaults.libraryPath, await realpath(temporaryDirectory));
+  assert.equal(defaults.exportPath, await realpath(path.join(temporaryDirectory, "outputs")));
+
+  const alternateLibrary = path.join(temporaryDirectory, "alternate-library");
+  const alternateExports = path.join(temporaryDirectory, "alternate-exports");
+  await mkdir(alternateLibrary);
+
+  const updateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...defaults,
+      sidebarCollapsed: false,
+      libraryPath: alternateLibrary,
+      exportPath: alternateExports,
+      shortcuts: { ...defaults.shortcuts, "edit.applyRange": "KeyR" },
+    }),
+  });
+  assert.equal(updateResponse.status, 200);
+  const updated = await updateResponse.json();
+  assert.equal(updated.sidebarCollapsed, false);
+  assert.equal(updated.shortcuts["edit.applyRange"], "KeyR");
+  assert.equal(updated.libraryPath, await realpath(alternateLibrary));
+  assert.equal(updated.exportPath, await realpath(alternateExports));
+  assert.equal((await stat(alternateExports)).isDirectory(), true);
+
+  const libraryResponse = await fetch(`${baseUrl}/api/files`);
+  const library = await libraryResponse.json();
+  assert.equal(library.mediaRoot, await realpath(alternateLibrary));
+  assert.deepEqual(library.files, []);
+
+  const restoreResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...defaults, exportPath: alternateExports }),
+  });
+  assert.equal(restoreResponse.status, 200);
+  registeredMedia = await registerSample();
 });
 
 test("exports a keyframe-aligned project without re-encoding", async () => {
@@ -190,11 +281,22 @@ test("exports a keyframe-aligned project without re-encoding", async () => {
   });
   assert.equal(createResponse.status, 202);
   const queuedJob = await createResponse.json();
+  assert.equal(queuedJob.status, "paused");
+  const resumeResponse = await fetch(`${baseUrl}/api/exports/${queuedJob.id}/resume`, { method: "POST" });
+  assert.equal(resumeResponse.status, 200);
   const job = await waitForExport(queuedJob.id);
   assert.equal(job.status, "completed", job.error);
   assert.equal(job.progress, 1);
   assert.equal(job.outputName, "fast-output.mp4");
+  const preferences = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  assert.equal(path.dirname(job.outputPath), preferences.exportPath);
   assert.ok((await stat(job.outputPath)).size > 0);
+
+  const queueResponse = await fetch(`${baseUrl}/api/exports`);
+  const queue = await queueResponse.json();
+  assert.ok(queue.jobs.some((candidate) => candidate.id === job.id && candidate.status === "completed"));
+  const invalidPauseResponse = await fetch(`${baseUrl}/api/exports/${job.id}/pause`, { method: "POST" });
+  assert.equal(invalidPauseResponse.status, 409);
 
   const { stdout } = await execFileAsync("ffprobe", [
     "-v",
@@ -242,6 +344,9 @@ test("re-encodes arbitrary edit points for frame-accurate export", async () => {
   });
   assert.equal(exportResponse.status, 202);
   const queuedJob = await exportResponse.json();
+  assert.equal(queuedJob.status, "paused");
+  const resumeResponse = await fetch(`${baseUrl}/api/exports/${queuedJob.id}/resume`, { method: "POST" });
+  assert.equal(resumeResponse.status, 200);
   const job = await waitForExport(queuedJob.id);
   assert.equal(job.status, "completed", job.error);
   assert.ok((await stat(job.outputPath)).size > 0);
@@ -257,4 +362,34 @@ test("re-encodes arbitrary edit points for frame-accurate export", async () => {
   ]);
   const duration = Number(stdout.trim());
   assert.ok(duration >= 0.48 && duration <= 0.56, `Unexpected duration: ${duration}`);
+});
+
+test("restores and clears the persisted export queue", async () => {
+  const exportsPath = path.join(temporaryDirectory, "data", "exports.json");
+  const deadline = Date.now() + 2_000;
+  let persistedJobs = [];
+  while (Date.now() < deadline) {
+    try {
+      persistedJobs = JSON.parse(await readFile(exportsPath, "utf8"));
+      if (persistedJobs.length >= 2 && persistedJobs.every((job) => job.status === "completed")) break;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(persistedJobs.length >= 2);
+
+  const restoredServer = await createApp({
+    mediaRoot: temporaryDirectory,
+    dataRoot: path.join(temporaryDirectory, "data"),
+    outputRoot: path.join(temporaryDirectory, "outputs"),
+  });
+  await new Promise((resolve) => restoredServer.listen(0, "127.0.0.1", resolve));
+  const restoredUrl = `http://127.0.0.1:${restoredServer.address().port}`;
+  const restored = await (await fetch(`${restoredUrl}/api/exports`)).json();
+  assert.equal(restored.jobs.length, persistedJobs.length);
+  await new Promise((resolve, reject) => restoredServer.close((error) => error ? reject(error) : resolve()));
+
+  const clearResponse = await fetch(`${baseUrl}/api/exports`, { method: "DELETE" });
+  assert.equal(clearResponse.status, 204);
+  const cleared = await (await fetch(`${baseUrl}/api/exports`)).json();
+  assert.deepEqual(cleared.jobs, []);
 });
