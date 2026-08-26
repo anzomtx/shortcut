@@ -66,6 +66,14 @@ export class ExportQueue {
     return true;
   }
 
+  resumeAll() {
+    let resumed = 0;
+    for (const job of this.list()) {
+      if (this.resume(job.id)) resumed += 1;
+    }
+    return resumed;
+  }
+
   stop(id) {
     const job = this.#jobs.get(id);
     if (!job || ["completed", "failed", "stopped", "stopping"].includes(job.status)) return false;

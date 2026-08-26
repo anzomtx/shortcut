@@ -44,9 +44,11 @@ For automatic server restarts during development:
 MEDIA_ROOT="/path/to/videos" npm run dev
 ```
 
-Open <http://127.0.0.1:4173> and click an MP4 filename in the local library. Files must contain an H.264 video stream.
+Open <http://127.0.0.1:4173> and click an MP4 filename in the local library, or drop an MP4 anywhere onto the video area — dropped files are located by name on disk and streamed in place, never copied. Files must contain an H.264 video stream.
 
 Projects, preferences, shortcut mappings, and metadata caches default to `.shortcut-data`. Exports default to `shortcut-exports` inside the media root. `MEDIA_ROOT` and `OUTPUT_ROOT` set the initial paths; saving new library and export paths in Preferences applies and persists them without a restart.
+
+Export filenames come from a configurable template such as `%o-%m-%h.%ext`, with tokens `%o` (project name), `%m` (mode), `%h` (short id), and `%ext` (extension); Preferences shows a live example. Import search folders tell the server where to look when matching dropped filenames.
 
 Remove mode starts with the complete source. Mark a sequence range and choose **Remove range** to subtract it; the remaining clips close the gap and retain source timestamps for export. Include mode starts empty and adds marked source ranges. Switching modes after editing requires confirmation and resets the sequence.
 

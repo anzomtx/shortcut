@@ -11,28 +11,32 @@ import { ExportQueue } from "./export-queue.mjs";
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_ROOT = path.resolve(SOURCE_DIRECTORY, "../public");
 const MAX_JSON_BYTES = 64 * 1024;
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024;
+const EXPORT_NAME_DEFAULT = "%o-%m-%h.%ext";
 const DEFAULT_PREFERENCES = {
   version: 1,
   sidebarCollapsed: true,
   defaultEditMode: "remove",
   libraryPath: null,
   exportPath: null,
+  exportNameTemplate: EXPORT_NAME_DEFAULT,
+  importSearchPaths: [],
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
     "playback.toggle": "Space",
-    "playback.previousKeyframe": "Comma",
-    "playback.nextKeyframe": "Period",
-    "playback.backward1": "ArrowLeft",
-    "playback.forward1": "ArrowRight",
-    "playback.backward3": "Shift+ArrowLeft",
-    "playback.forward3": "Shift+ArrowRight",
-    "playback.backward6": "BracketLeft",
-    "playback.forward6": "BracketRight",
-    "playback.backward10": "Shift+BracketLeft",
-    "playback.forward10": "Shift+BracketRight",
-    "edit.markIn": "KeyI",
-    "edit.markOut": "KeyO",
+    "playback.previousKeyframe": "ArrowDown",
+    "playback.nextKeyframe": "ArrowUp",
+    "playback.backward1": null,
+    "playback.forward1": null,
+    "playback.backward3": "ArrowLeft",
+    "playback.forward3": "ArrowRight",
+    "playback.backward6": null,
+    "playback.forward6": null,
+    "playback.backward10": null,
+    "playback.forward10": null,
+    "edit.markIn": "KeyZ",
+    "edit.markOut": "KeyC",
     "edit.applyRange": "KeyX",
     "edit.removeSelected": "Delete",
     "edit.undo": "Mod+KeyZ",
@@ -247,6 +251,7 @@ function serializeMedia(media) {
     id: media.id,
     name: media.name,
     relativePath: media.relativePath,
+    absolutePath: media.relativePath ? null : media.absolutePath,
     size: media.size,
     ...metadata,
     keyframeCount: keyframesUs.length,
@@ -320,6 +325,48 @@ async function readPreferences(preferencesPath) {
   }
 }
 
+function validateExportNameTemplate(value) {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > 100) {
+    const error = new Error("Export name template must be between 1 and 100 characters");
+    error.statusCode = 400;
+    throw error;
+  }
+  const template = value.trim();
+  if (template.includes("/") || template.includes("\\") || template.includes("..")) {
+    const error = new Error("Export name template cannot contain path separators");
+    error.statusCode = 400;
+    throw error;
+  }
+  const unknownTokens = [...template.matchAll(/%([a-zA-Z]+)%?/g)]
+    .map((match) => match[1])
+    .filter((token) => !["o", "m", "h", "ext"].includes(token));
+  if (unknownTokens.length > 0) {
+    const error = new Error(`Unknown template token %${unknownTokens[0]}. Use %o, %m, %h, or %ext.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return template;
+}
+
+function validateImportSearchPaths(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 20) {
+    const error = new Error("Import search paths must be a list of at most 20 folders");
+    error.statusCode = 400;
+    throw error;
+  }
+  const normalized = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry.trim() || !path.isAbsolute(entry)) {
+      const error = new Error("Every import search path must be an absolute folder path");
+      error.statusCode = 400;
+      throw error;
+    }
+    normalized.push(path.normalize(entry.trim()));
+  }
+  return [...new Set(normalized)];
+}
+
 function validatePreferences(body) {
   if (
     typeof body.sidebarCollapsed !== "boolean" ||
@@ -338,6 +385,10 @@ function validatePreferences(body) {
     error.statusCode = 400;
     throw error;
   }
+  const exportNameTemplate = body.exportNameTemplate === undefined
+    ? EXPORT_NAME_DEFAULT
+    : validateExportNameTemplate(body.exportNameTemplate);
+  const importSearchPaths = validateImportSearchPaths(body.importSearchPaths);
   const entries = Object.entries(body.shortcuts);
   if (entries.length > 100) {
     const error = new Error("Too many shortcut mappings");
@@ -362,6 +413,8 @@ function validatePreferences(body) {
     defaultEditMode: body.defaultEditMode,
     libraryPath: path.normalize(body.libraryPath.trim()),
     exportPath: path.normalize(body.exportPath.trim()),
+    exportNameTemplate,
+    importSearchPaths,
     shortcuts,
   };
 }
@@ -417,6 +470,7 @@ function validateProjectInput(body, mediaRegistry) {
     source: {
       mediaId: media.id,
       relativePath: media.relativePath,
+      absolutePath: media.relativePath ? null : media.absolutePath,
       name: media.name,
     },
     segments,
@@ -442,7 +496,7 @@ function validateProjectImport(body) {
   return project;
 }
 
-function createExportName(project, mode, requestedName, jobId) {
+function createExportName(project, mode, requestedName, jobId, template = EXPORT_NAME_DEFAULT) {
   if (requestedName !== undefined) {
     if (
       typeof requestedName !== "string" ||
@@ -459,7 +513,15 @@ function createExportName(project, mode, requestedName, jobId) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 48) || "shortcut-export";
-  return `${slug}-${mode}-${jobId.slice(0, 8)}.mp4`;
+  let name = template
+    .replaceAll("%o", slug)
+    .replaceAll("%m", mode)
+    .replaceAll("%h", jobId.slice(0, 8))
+    .replaceAll("%ext", "mp4");
+  name = name.replace(/[^a-zA-Z0-9._ -]+/g, "").trim().slice(0, 120);
+  if (!name) name = `${slug}-${mode}-${jobId.slice(0, 8)}.mp4`;
+  if (!/\.mp4$/i.test(name)) name += ".mp4";
+  return name;
 }
 
 function serializeExport(job) {
@@ -649,27 +711,8 @@ export async function createApp(options = {}) {
     return exportWrite;
   }
 
-  async function registerMedia(relativePath) {
-    if (typeof relativePath !== "string" || path.isAbsolute(relativePath)) {
-      const error = new Error("relativePath must be a relative file path");
-      error.statusCode = 400;
-      throw error;
-    }
-
-    const requestedPath = path.resolve(mediaRoot, relativePath);
-    if (!isWithin(mediaRoot, requestedPath)) {
-      const error = new Error("File is outside the configured media root");
-      error.statusCode = 403;
-      throw error;
-    }
-
-    const filePath = await realpath(requestedPath);
-    if (!isWithin(mediaRoot, filePath)) {
-      const error = new Error("File is outside the configured media root");
-      error.statusCode = 403;
-      throw error;
-    }
-
+  async function registerMediaByPath(resolvedPath) {
+    const filePath = await realpath(resolvedPath);
     const fileStat = await stat(filePath);
     if (!fileStat.isFile() || path.extname(filePath).toLowerCase() !== ".mp4") {
       const error = new Error("Only MP4 files can be registered");
@@ -692,13 +735,65 @@ export async function createApp(options = {}) {
     const media = {
       id,
       name: path.basename(filePath),
-      relativePath: path.relative(mediaRoot, filePath),
+      relativePath: isWithin(mediaRoot, filePath) ? path.relative(mediaRoot, filePath) : null,
+      absolutePath: filePath,
       path: filePath,
       size: fileStat.size,
       analysis,
     };
     mediaRegistry.set(id, media);
     return media;
+  }
+
+  async function registerMedia(relativePath) {
+    if (typeof relativePath !== "string" || path.isAbsolute(relativePath)) {
+      const error = new Error("relativePath must be a relative file path");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const requestedPath = path.resolve(mediaRoot, relativePath);
+    if (!isWithin(mediaRoot, requestedPath)) {
+      const error = new Error("File is outside the configured media root");
+      error.statusCode = 403;
+      throw error;
+    }
+    const filePath = await realpath(requestedPath);
+    if (!isWithin(mediaRoot, filePath)) {
+      const error = new Error("File is outside the configured media root");
+      error.statusCode = 403;
+      throw error;
+    }
+    return registerMediaByPath(filePath);
+  }
+
+  async function locateMediaFile(name) {
+    const searchRoots = [mediaRoot, ...preferences.importSearchPaths];
+    const matches = [];
+    async function scan(directory, depth) {
+      if (depth > 12 || matches.length > 64) return;
+      let entries;
+      try {
+        entries = await readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.name.startsWith(".")) continue;
+        const absolutePath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await scan(absolutePath, depth + 1);
+        } else if (entry.isFile() && entry.name.toLowerCase() === name.toLowerCase()) {
+          matches.push(absolutePath);
+        }
+      }
+    }
+    await Promise.all(searchRoots.map((root) => scan(root, 0)));
+    if (matches.length === 0) return null;
+    matches.sort((left, right) =>
+      left.split(path.sep).length - right.split(path.sep).length || left.localeCompare(right),
+    );
+    return registerMediaByPath(matches[0]);
   }
 
   const exportQueue = new ExportQueue({
@@ -748,6 +843,16 @@ export async function createApp(options = {}) {
         await exportWrite;
         response.writeHead(204, { "Cache-Control": "no-store" });
         response.end();
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/exports/start") {
+        const resumed = exportQueue.resumeAll();
+        await exportWrite;
+        sendJson(response, 200, {
+          resumed,
+          jobs: exportQueue.list().map(serializeExport),
+        });
         return;
       }
 
@@ -810,7 +915,7 @@ export async function createApp(options = {}) {
         }
 
         const id = randomUUID();
-        const outputName = createExportName(project, body.mode, body.outputName, id);
+        const outputName = createExportName(project, body.mode, body.outputName, id, preferences.exportNameTemplate);
         const job = {
           id,
           projectId: project.id,
@@ -979,9 +1084,39 @@ export async function createApp(options = {}) {
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/api/library/locate") {
+        const body = await readJson(request);
+        if (typeof body.name !== "string" || !body.name.trim() || body.name.includes("/") || body.name.includes("\\")) {
+          const error = new Error("name must be a bare file name");
+          error.statusCode = 400;
+          throw error;
+        }
+        const media = await locateMediaFile(body.name.trim());
+        if (!media) {
+          const error = new Error(`"${body.name.trim()}" was not found in the library or import search folders`);
+          error.statusCode = 404;
+          throw error;
+        }
+        sendJson(response, 201, serializeMedia(media));
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/api/media") {
         const body = await readJson(request);
-        const media = await registerMedia(body.relativePath);
+        let media;
+        if (typeof body.absolutePath === "string" && body.absolutePath.trim()) {
+          const resolved = path.resolve(body.absolutePath.trim());
+          const allowedRoots = [mediaRoot, ...preferences.importSearchPaths];
+          const filePath = await realpath(resolved).catch(() => null);
+          if (!filePath || !allowedRoots.some((root) => isWithin(root, filePath))) {
+            const error = new Error("Absolute media paths must live inside the library or an import search folder");
+            error.statusCode = 403;
+            throw error;
+          }
+          media = await registerMediaByPath(filePath);
+        } else {
+          media = await registerMedia(body.relativePath);
+        }
         sendJson(response, 201, serializeMedia(media));
         return;
       }

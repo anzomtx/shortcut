@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -362,6 +362,97 @@ test("re-encodes arbitrary edit points for frame-accurate export", async () => {
   ]);
   const duration = Number(stdout.trim());
   assert.ok(duration >= 0.48 && duration <= 0.56, `Unexpected duration: ${duration}`);
+});
+
+test("locates dropped filenames through import search folders", async () => {
+  const searchFolder = path.join(temporaryDirectory, "search-roots");
+  await mkdir(searchFolder, { recursive: true });
+  await copyFile(path.join(temporaryDirectory, "sample.mp4"), path.join(searchFolder, "Located Sample.mp4"));
+
+  const currentPreferences = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  const updateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...currentPreferences, importSearchPaths: [searchFolder] }),
+  });
+  assert.equal(updateResponse.status, 200);
+
+  const locateResponse = await fetch(`${baseUrl}/api/library/locate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "located sample.mp4" }),
+  });
+  assert.equal(locateResponse.status, 201);
+  const located = await locateResponse.json();
+  assert.equal(located.name, "Located Sample.mp4");
+
+  const missingResponse = await fetch(`${baseUrl}/api/library/locate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "does-not-exist.mp4" }),
+  });
+  assert.equal(missingResponse.status, 404);
+
+  const restoreResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...currentPreferences, importSearchPaths: [] }),
+  });
+  assert.equal(restoreResponse.status, 200);
+});
+
+test("names exports from the filename template preference", async () => {
+  assert.ok(savedProject);
+  const templateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...(await (await fetch(`${baseUrl}/api/preferences`)).json()),
+      exportNameTemplate: "%o e.%ext",
+    }),
+  });
+  assert.equal(templateResponse.status, 200);
+
+  const createResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId: savedProject.id, mode: "fast" }),
+  });
+  assert.equal(createResponse.status, 202);
+  const job = await createResponse.json();
+  const expectedSlug = savedProject.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  assert.equal(job.outputName, `${expectedSlug} e.mp4`);
+  await fetch(`${baseUrl}/api/exports/${job.id}/stop`, { method: "POST" });
+});
+
+test("starts all paused exports from the queue", async () => {
+  assert.ok(savedProject);
+  for (const mode of ["fast", "accurate"]) {
+    const createResponse = await fetch(`${baseUrl}/api/exports`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: savedProject.id, mode }),
+    });
+    assert.equal(createResponse.status, 202);
+    const job = await createResponse.json();
+    assert.equal(job.status, "paused");
+  }
+
+  const startResponse = await fetch(`${baseUrl}/api/exports/start`, { method: "POST" });
+  assert.equal(startResponse.status, 200);
+  const startResult = await startResponse.json();
+  assert.equal(startResult.resumed, 2);
+  assert.ok(startResult.jobs.some((job) => job.status === "running"));
+
+  const idleResponse = await fetch(`${baseUrl}/api/exports/start`, { method: "POST" });
+  const idleResult = await idleResponse.json();
+  assert.equal(idleResult.resumed, 0);
+
+  await Promise.all(
+    startResult.jobs
+      .filter((job) => ["paused", "queued", "running"].includes(job.status))
+      .map((job) => waitForExport(job.id)),
+  );
 });
 
 test("restores and clears the persisted export queue", async () => {

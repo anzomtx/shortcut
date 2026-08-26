@@ -156,7 +156,10 @@
               <h2>Export queue</h2>
               <output id="export-queue-summary">Queue empty</output>
             </div>
-            <button type="button" id="clear-export-queue">Clear</button>
+            <div class="export-queue-heading-actions">
+              <button type="button" id="start-export-queue" disabled>Start</button>
+              <button type="button" id="clear-export-queue" disabled>Clear</button>
+            </div>
           </div>
           <ol class="export-queue-list bounded-list" id="export-queue-list"></ol>
         </section>
@@ -191,6 +194,18 @@
         <label class="preference-field path-preference" for="export-path">
           <span>Export path</span>
           <input id="export-path" type="text" autocomplete="off" spellcheck="false" />
+        </label>
+
+        <label class="preference-field path-preference" for="export-name-template">
+          <span>Export filename template</span>
+          <input id="export-name-template" type="text" autocomplete="off" spellcheck="false" maxlength="100" />
+          <small>Tokens: %o project name · %m mode · %h short id · %ext extension. Example: <output id="export-name-example"></output></small>
+        </label>
+
+        <label class="preference-field path-preference" for="import-search-paths">
+          <span>Import search folders</span>
+          <textarea id="import-search-paths" rows="4" autocomplete="off" spellcheck="false" placeholder="/absolute/folder/one per line"></textarea>
+          <small>Dropped files are located by filename in these folders (and the library) — never uploaded or copied.</small>
         </label>
 
         <section class="shortcut-section" aria-labelledby="shortcuts-title">

@@ -12,22 +12,24 @@ const DEFAULT_PREFERENCES = {
   defaultEditMode: "remove",
   libraryPath: "",
   exportPath: "",
+  exportNameTemplate: "%o-%m-%h.%ext",
+  importSearchPaths: [],
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
     "playback.toggle": "Space",
-    "playback.previousKeyframe": "Comma",
-    "playback.nextKeyframe": "Period",
-    "playback.backward1": "ArrowLeft",
-    "playback.forward1": "ArrowRight",
-    "playback.backward3": "Shift+ArrowLeft",
-    "playback.forward3": "Shift+ArrowRight",
-    "playback.backward6": "BracketLeft",
-    "playback.forward6": "BracketRight",
-    "playback.backward10": "Shift+BracketLeft",
-    "playback.forward10": "Shift+BracketRight",
-    "edit.markIn": "KeyI",
-    "edit.markOut": "KeyO",
+    "playback.previousKeyframe": "ArrowDown",
+    "playback.nextKeyframe": "ArrowUp",
+    "playback.backward1": null,
+    "playback.forward1": null,
+    "playback.backward3": "ArrowLeft",
+    "playback.forward3": "ArrowRight",
+    "playback.backward6": null,
+    "playback.forward6": null,
+    "playback.backward10": null,
+    "playback.forward10": null,
+    "edit.markIn": "KeyZ",
+    "edit.markOut": "KeyC",
     "edit.applyRange": "KeyX",
     "edit.removeSelected": "Delete",
     "edit.undo": "Mod+KeyZ",
@@ -37,6 +39,7 @@ const DEFAULT_PREFERENCES = {
 };
 
 const video = document.querySelector("#video");
+const viewerShell = document.querySelector(".viewer-shell");
 const viewerEmpty = document.querySelector("#viewer-empty");
 const viewerTitle = document.querySelector("#viewer-title");
 const metadata = document.querySelector("#media-metadata");
@@ -64,6 +67,7 @@ const exportAccurateButton = document.querySelector("#export-accurate");
 const exportQueueList = document.querySelector("#export-queue-list");
 const exportQueueSummary = document.querySelector("#export-queue-summary");
 const clearExportQueueButton = document.querySelector("#clear-export-queue");
+const startExportQueueButton = document.querySelector("#start-export-queue");
 const appLayout = document.querySelector("#app-layout");
 const libraryPanel = document.querySelector("#library-panel");
 const panelResizer = document.querySelector("#panel-resizer");
@@ -77,6 +81,9 @@ const closePreferencesButton = document.querySelector("#close-preferences");
 const defaultEditModeSelect = document.querySelector("#default-edit-mode");
 const libraryPathInput = document.querySelector("#library-path");
 const exportPathInput = document.querySelector("#export-path");
+const exportNameTemplateInput = document.querySelector("#export-name-template");
+const exportNameExample = document.querySelector("#export-name-example");
+const importSearchPathsInput = document.querySelector("#import-search-paths");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
@@ -185,6 +192,8 @@ function currentEditTimeUs() {
 }
 
 function isKeyframe(timestampUs) {
+  if (keyframesUs.length === 0) return false;
+  if (timestampUs <= keyframesUs[0]) return true;
   let low = 0;
   let high = keyframesUs.length;
   while (low < high) {
@@ -193,8 +202,30 @@ function isKeyframe(timestampUs) {
     else high = middle;
   }
   return [keyframesUs[low - 1], keyframesUs[low]].some(
-    (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= 2_000,
+    (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= 80_000,
   );
+}
+
+function snapToKeyframe(timestampUs) {
+  let low = 0;
+  let high = keyframesUs.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (keyframesUs[middle] < timestampUs) low = middle + 1;
+    else high = middle;
+  }
+  const candidates = [keyframesUs[low - 1], keyframesUs[low]];
+  let best = timestampUs;
+  let bestDelta = Infinity;
+  for (const keyframe of candidates) {
+    if (!Number.isFinite(keyframe)) continue;
+    const delta = Math.abs(keyframe - timestampUs);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = keyframe;
+    }
+  }
+  return bestDelta <= 80_000 ? best : timestampUs;
 }
 
 function sequenceKeyframesUs() {
@@ -565,38 +596,92 @@ async function request(url, options) {
   return data;
 }
 
-async function loadMedia(relativePath, button) {
+function adoptMedia(media, keyframes) {
+  currentMedia = media;
+  keyframesUs = keyframes;
+  editMode = preferences.defaultEditMode;
+  includeModeButton.classList.toggle("active", editMode === "include");
+  removeModeButton.classList.toggle("active", editMode === "remove");
+  applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
+  video.src = media.streamUrl;
+  video.load();
+  viewerEmpty.hidden = true;
+  viewerTitle.textContent = media.name;
+  metadata.textContent = `${media.video.width}x${media.video.height} · ${formatDuration(media.durationUs / 1_000_000)} · ${media.video.averageFrameRate?.toFixed(3) ?? "?"} fps · ${formatBytes(media.size)}`;
+  currentProjectId = null;
+  projectName.value = `${media.name.replace(/\.mp4$/i, "")} edit`;
+  selectedMediaPath = media.relativePath ?? selectedMediaPath;
+  resetHistory();
+  resetSequence(false);
+  notice.textContent = `Source indexed with ${keyframesUs.length} keyframe${keyframesUs.length === 1 ? "" : "s"}.`;
+}
+
+async function loadMedia(locator, button) {
   notice.textContent = "Validating media and indexing keyframes...";
   if (button) button.disabled = true;
   try {
+    const body = typeof locator === "string"
+      ? { relativePath: locator }
+      : locator.absolutePath
+        ? { absolutePath: locator.absolutePath }
+        : { relativePath: locator.relativePath };
     const media = await request("/api/media", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ relativePath }),
+      body: JSON.stringify(body),
     });
     const keyframeIndex = await request(media.keyframesUrl);
-    currentMedia = media;
-    keyframesUs = keyframeIndex.keyframesUs;
-    editMode = preferences.defaultEditMode;
-    includeModeButton.classList.toggle("active", editMode === "include");
-    removeModeButton.classList.toggle("active", editMode === "remove");
-    applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
-    video.src = media.streamUrl;
-    video.load();
-    viewerEmpty.hidden = true;
-    viewerTitle.textContent = media.name;
-    metadata.textContent = `${media.video.width}x${media.video.height} · ${formatDuration(media.durationUs / 1_000_000)} · ${media.video.averageFrameRate?.toFixed(3) ?? "?"} fps · ${formatBytes(media.size)}`;
-    currentProjectId = null;
-    projectName.value = `${media.name.replace(/\.mp4$/i, "")} edit`;
-    resetHistory();
-    resetSequence(false);
-    notice.textContent = `Source indexed with ${keyframesUs.length} keyframe${keyframesUs.length === 1 ? "" : "s"}.`;
+    adoptMedia(media, keyframeIndex.keyframesUs);
     return true;
   } catch (error) {
     notice.textContent = error.message;
     return false;
   } finally {
     if (button) button.disabled = false;
+  }
+}
+
+async function loadLocatedMedia(name, button) {
+  notice.textContent = `Locating "${name}" on this machine...`;
+  if (button) button.disabled = true;
+  try {
+    const media = await request("/api/library/locate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const keyframeIndex = await request(media.keyframesUrl);
+    adoptMedia(media, keyframeIndex.keyframesUs);
+    return true;
+  } catch (error) {
+    notice.textContent = error.message;
+    return false;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function loadDroppedFile(file) {
+  if (!file || !/\.mp4$/i.test(file.name)) {
+    notice.textContent = "Only MP4 files can be opened by dropping.";
+    return;
+  }
+  notice.textContent = `Locating "${file.name}" on this machine...`;
+  viewerShell.classList.add("drop-target");
+  try {
+    const media = await request("/api/library/locate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: file.name }),
+    });
+    const keyframeIndex = await request(media.keyframesUrl);
+    adoptMedia(media, keyframeIndex.keyframesUs);
+    await refreshLibrary();
+    notice.textContent = `Opened "${file.name}" from disk. Nothing was copied.`;
+  } catch (error) {
+    notice.textContent = error.message;
+  } finally {
+    viewerShell.classList.remove("drop-target");
   }
 }
 
@@ -754,7 +839,10 @@ async function loadProject(projectId, button) {
   notice.textContent = "Opening saved project...";
   try {
     const project = await request(`/api/projects/${projectId}`);
-    const loaded = await loadMedia(project.source.relativePath, null);
+    const source = project.source;
+    const loaded = source.relativePath || !source.name
+      ? await loadMedia({ relativePath: source.relativePath }, null)
+      : await loadLocatedMedia(source.name, null);
     if (!loaded) return;
     currentProjectId = project.id;
     selectedProjectId = project.id;
@@ -840,6 +928,7 @@ async function beginExport(mode) {
 function renderExportQueue(jobs) {
   exportQueueList.replaceChildren();
   clearExportQueueButton.disabled = jobs.length === 0;
+  startExportQueueButton.disabled = !jobs.some((job) => job.status === "paused");
   const activeJobs = jobs.filter((job) => ["queued", "running", "paused", "stopping"].includes(job.status));
   exportQueueSummary.value = activeJobs.length === 0
     ? jobs.length === 0 ? "Queue empty" : "No active jobs"
@@ -958,6 +1047,18 @@ async function clearExportQueue() {
   }
 }
 
+async function startExportQueue() {
+  try {
+    const result = await request("/api/exports/start", { method: "POST" });
+    notice.textContent = result.resumed === 0
+      ? "No paused exports to start."
+      : `Started ${result.resumed} export${result.resumed === 1 ? "" : "s"}.`;
+    await refreshExportQueue();
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
 function activatePanelTab(name) {
   for (const tab of panelTabs) {
     const selected = tab.dataset.panelTab === name;
@@ -1028,6 +1129,13 @@ function displayShortcut(shortcut) {
 }
 
 function renderShortcutEditor() {
+  const card = shortcutList.closest(".preferences-card");
+  const listScroll = shortcutList.scrollTop;
+  const cardScroll = card?.scrollTop ?? 0;
+  const activeElement = document.activeElement;
+  const focusRestorer = capturingActionId
+    ? null
+    : activeElement && shortcutList.contains(activeElement) ? activeElement.dataset.shortcutAction : null;
   shortcutList.replaceChildren();
   for (const action of ACTIONS) {
     const row = document.createElement("div");
@@ -1053,6 +1161,19 @@ function renderShortcutEditor() {
     row.append(label, binding, clear);
     shortcutList.append(row);
   }
+  shortcutList.scrollTop = listScroll;
+  if (card) card.scrollTop = cardScroll;
+}
+
+function updateExportNameExample() {
+  const example = (exportNameTemplateInput.value || DEFAULT_PREFERENCES.exportNameTemplate)
+    .replaceAll("%o", "my-project")
+    .replaceAll("%m", "fast")
+    .replaceAll("%h", "a1b2c3d4")
+    .replaceAll("%ext", "mp4")
+    .replace(/[^a-zA-Z0-9._ -]+/g, "")
+    .trim() || "my-project-fast-a1b2c3d4.mp4";
+  exportNameExample.textContent = /\.mp4$/i.test(example) ? example : `${example}.mp4`;
 }
 
 function openPreferences() {
@@ -1060,6 +1181,9 @@ function openPreferences() {
   defaultEditModeSelect.value = preferencesDraft.defaultEditMode;
   libraryPathInput.value = preferencesDraft.libraryPath;
   exportPathInput.value = preferencesDraft.exportPath;
+  exportNameTemplateInput.value = preferencesDraft.exportNameTemplate || DEFAULT_PREFERENCES.exportNameTemplate;
+  importSearchPathsInput.value = (preferencesDraft.importSearchPaths ?? []).join("\n");
+  updateExportNameExample();
   capturingActionId = null;
   preferencesMessage.textContent = "";
   renderShortcutEditor();
@@ -1072,6 +1196,11 @@ async function savePreferences() {
   preferencesDraft.defaultEditMode = defaultEditModeSelect.value;
   preferencesDraft.libraryPath = libraryPathInput.value;
   preferencesDraft.exportPath = exportPathInput.value;
+  preferencesDraft.exportNameTemplate = exportNameTemplateInput.value;
+  preferencesDraft.importSearchPaths = importSearchPathsInput.value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
   try {
     await persistPreferences(preferencesDraft);
     await refreshLibrary();
@@ -1107,8 +1236,8 @@ const ACTIONS = [
   ]),
   { id: "edit.modeInclude", label: "Switch to Include mode", group: "Edit", run: () => changeEditMode("include") },
   { id: "edit.modeRemove", label: "Switch to Remove mode", group: "Edit", run: () => changeEditMode("remove") },
-  { id: "edit.markIn", label: "Mark in", group: "Edit", run: () => { markInUs = currentEditTimeUs(); renderMarks(); } },
-  { id: "edit.markOut", label: "Mark out", group: "Edit", run: () => { markOutUs = currentEditTimeUs(); renderMarks(); } },
+  { id: "edit.markIn", label: "Mark in", group: "Edit", run: () => { markInUs = snapToKeyframe(currentEditTimeUs()); renderMarks(); } },
+  { id: "edit.markOut", label: "Mark out", group: "Edit", run: () => { markOutUs = snapToKeyframe(currentEditTimeUs()); renderMarks(); } },
   { id: "edit.applyRange", label: "Apply marked range", group: "Edit", run: applyMarkedRange },
   { id: "edit.removeSelected", label: "Remove selected clip", group: "Edit", run: removeSelectedSegment },
   { id: "edit.undo", label: "Undo", group: "Edit", run: undoEdit },
@@ -1138,6 +1267,7 @@ projectFileInput.addEventListener("change", () => importProject(projectFileInput
 exportFastButton.addEventListener("click", () => executeAction("export.fast"));
 exportAccurateButton.addEventListener("click", () => executeAction("export.accurate"));
 clearExportQueueButton.addEventListener("click", clearExportQueue);
+startExportQueueButton.addEventListener("click", startExportQueue);
 includeModeButton.addEventListener("click", () => executeAction("edit.modeInclude"));
 removeModeButton.addEventListener("click", () => executeAction("edit.modeRemove"));
 for (const tab of panelTabs) {
@@ -1177,6 +1307,15 @@ preferencesDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
   saveAndClosePreferences();
 });
+preferencesDialog.addEventListener("click", (event) => {
+  if (event.target === preferencesDialog) saveAndClosePreferences();
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!preferencesDialog.open) return;
+  if (event.composedPath().includes(preferencesDialog)) return;
+  saveAndClosePreferences();
+});
+exportNameTemplateInput.addEventListener("input", updateExportNameExample);
 timeline.addEventListener("pointerdown", (event) => seekTimeline(event.clientX));
 timeline.addEventListener("keydown", (event) => {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
@@ -1203,17 +1342,18 @@ document.addEventListener("keydown", (event) => {
       ([actionId, candidate]) => actionId !== capturingActionId && candidate === shortcut,
     );
     if (conflict) {
-      preferencesMessage.textContent = `${displayShortcut(shortcut)} is already assigned to ${ACTION_MAP.get(conflict[0])?.label ?? conflict[0]}.`;
-      return;
+      preferencesDraft.shortcuts[conflict[0]] = null;
     }
     preferencesDraft.shortcuts[capturingActionId] = shortcut;
     capturingActionId = null;
-    preferencesMessage.textContent = "Shortcut updated. Press Enter or close Preferences to apply it.";
+    preferencesMessage.textContent = conflict
+      ? `${displayShortcut(shortcut)} reassigned from ${ACTION_MAP.get(conflict[0])?.label ?? conflict[0]}. Press Enter or close Preferences to apply it.`
+      : "Shortcut updated. Press Enter or close Preferences to apply it.";
     renderShortcutEditor();
     return;
   }
 
-  if (preferencesDialog.open || event.target.closest("input, select, textarea, [contenteditable='true']")) return;
+  if (preferencesDialog.open || (event.target.closest?.("input, select, textarea, [contenteditable='true']") ?? false)) return;
   const shortcut = normalizeShortcutEvent(event);
   const actionId = findShortcutAction(preferences.shortcuts, shortcut);
   const action = ACTION_MAP.get(actionId);
@@ -1238,6 +1378,20 @@ video.addEventListener("play", () => {
 });
 video.addEventListener("error", () => {
   notice.textContent = "The browser could not decode this video.";
+});
+viewerShell.addEventListener("dragover", (event) => {
+  if (![...event.dataTransfer.items].some((item) => item.kind === "file")) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "link";
+  viewerShell.classList.add("drop-target");
+});
+viewerShell.addEventListener("dragleave", (event) => {
+  if (event.target === viewerShell) viewerShell.classList.remove("drop-target");
+});
+viewerShell.addEventListener("drop", (event) => {
+  event.preventDefault();
+  viewerShell.classList.remove("drop-target");
+  loadDroppedFile(event.dataTransfer.files[0]);
 });
 new ResizeObserver(drawTimeline).observe(timeline);
 

@@ -56,6 +56,8 @@ async function runFfmpeg(ffmpegPath, args, options = {}) {
 }
 
 export function isKeyframeAligned(keyframesUs, timestampUs) {
+  if (!Array.isArray(keyframesUs) || keyframesUs.length === 0) return false;
+  if (timestampUs <= keyframesUs[0]) return true;
   let low = 0;
   let high = keyframesUs.length;
   while (low < high) {
@@ -64,7 +66,7 @@ export function isKeyframeAligned(keyframesUs, timestampUs) {
     else high = middle;
   }
   return [keyframesUs[low - 1], keyframesUs[low]].some(
-    (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= 2_000,
+    (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= 80_000,
   );
 }
 
