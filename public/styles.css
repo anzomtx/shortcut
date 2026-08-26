@@ -1022,6 +1022,60 @@ video::-webkit-media-controls {
   gap: 0.75rem;
 }
 
+.admin-dialog {
+  width: min(720px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #57594f;
+  color: #e8e7df;
+  background: #151612;
+  box-shadow: 0 30px 100px rgba(0, 0, 0, 0.7);
+}
+
+.admin-dialog::backdrop {
+  background: rgba(4, 5, 3, 0.78);
+  backdrop-filter: blur(4px);
+}
+
+.admin-card {
+  gap: 1rem;
+}
+
+.admin-log {
+  height: min(50vh, 420px);
+  padding: 0.85rem;
+  overflow-y: auto;
+  border: 1px solid #34362f;
+  background: #0b0c09;
+  color: #a6a89d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  line-height: 1.7;
+  overscroll-behavior: contain;
+}
+
+.admin-log .log-entry {
+  overflow-wrap: anywhere;
+}
+
+.admin-log .log-time {
+  margin-right: 0.6rem;
+  color: #565849;
+}
+
+.admin-log .log-entry.log-error {
+  color: #ef6e68;
+}
+
+.admin-log .log-entry.log-warn {
+  color: #f0a36e;
+}
+
+.admin-log .log-empty {
+  color: #777a6e;
+}
+
 .project-list .empty-projects {
   display: block;
   padding: 1rem;

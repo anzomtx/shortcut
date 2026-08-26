@@ -683,6 +683,17 @@ export async function createApp(options = {}) {
   let preferenceWrite = Promise.resolve();
   let exportWrite = Promise.resolve();
 
+  const adminLogEntries = [];
+  function logAdmin(message, level = "info") {
+    const entry = { at: new Date().toISOString(), level, message };
+    adminLogEntries.push(entry);
+    if (adminLogEntries.length > 500) adminLogEntries.splice(0, adminLogEntries.length - 500);
+    return entry;
+  }
+  logAdmin("Server started");
+  logAdmin(`Library folder: ${mediaRoot}`);
+  logAdmin(`Export folder: ${outputRoot}`);
+
   function persistProjects() {
     projectWrite = projectWrite.catch(() => {}).then(async () => {
       const temporaryPath = `${projectsPath}.${process.pid}.tmp`;
@@ -723,10 +734,12 @@ export async function createApp(options = {}) {
     const id = createHash("sha256").update(filePath).digest("hex").slice(0, 24);
     let analysis = await readCachedAnalysis(cacheDirectory, id, fileStat);
     if (!analysis) {
+      logAdmin(`Analyzing ${path.basename(filePath)} with ffprobe...`);
       analysis = await analyzeMedia(filePath, ffprobePath);
       if (analysis) await writeCachedAnalysis(cacheDirectory, id, fileStat, analysis);
     }
     if (!analysis || analysis.video.codec !== "h264") {
+      logAdmin(`${path.basename(filePath)} rejected: no H.264 video stream`, "error");
       const error = new Error("The MP4 must contain an H.264 video stream");
       error.statusCode = 415;
       throw error;
@@ -742,6 +755,7 @@ export async function createApp(options = {}) {
       analysis,
     };
     mediaRegistry.set(id, media);
+    logAdmin(`Registered ${media.name} (${keyframeLabel(analysis)})`);
     return media;
   }
 
@@ -769,6 +783,7 @@ export async function createApp(options = {}) {
 
   async function locateMediaFile(name) {
     const searchRoots = [mediaRoot, ...preferences.importSearchPaths];
+    logAdmin(`Searching for "${name}" in ${searchRoots.length} folder${searchRoots.length === 1 ? "" : "s"}...`);
     const matches = [];
     async function scan(directory, depth) {
       if (depth > 12 || matches.length > 64) return;
@@ -789,16 +804,39 @@ export async function createApp(options = {}) {
       }
     }
     await Promise.all(searchRoots.map((root) => scan(root, 0)));
-    if (matches.length === 0) return null;
+    if (matches.length === 0) {
+      logAdmin(`"${name}" was not found`, "error");
+      return null;
+    }
     matches.sort((left, right) =>
       left.split(path.sep).length - right.split(path.sep).length || left.localeCompare(right),
     );
+    logAdmin(`Found "${name}" at ${matches[0]}`);
     return registerMediaByPath(matches[0]);
   }
 
+  function keyframeLabel(analysis) {
+    const count = analysis.keyframesUs.length;
+    return `${count} keyframe${count === 1 ? "" : "s"}`;
+  }
+
+  const loggedExportStatuses = new Map();
   const exportQueue = new ExportQueue({
     jobs: restoredExportJobs,
-    onChange: (_job, jobs) => {
+    onChange: (job, jobs) => {
+      if (job) {
+        const previous = loggedExportStatuses.get(job.id);
+        if (previous !== job.status) {
+          loggedExportStatuses.set(job.id, job.status);
+          const label = job.outputName;
+          if (job.status === "running") logAdmin(`Exporting ${label}...`);
+          else if (job.status === "paused") logAdmin(`Export paused: ${label}`);
+          else if (job.status === "stopping") logAdmin(`Stopping export ${label}...`);
+          else if (job.status === "completed") logAdmin(`Export completed: ${label}`);
+          else if (job.status === "stopped") logAdmin(`Export stopped: ${label}`, "warn");
+          else if (job.status === "failed") logAdmin(`Export failed: ${label} (${job.error ?? "unknown error"})`, "error");
+        }
+      }
       persistExportJobs(jobs).catch((error) => console.error("Unable to persist export queue", error));
     },
     runner: async (job, control) => {
@@ -838,6 +876,40 @@ export async function createApp(options = {}) {
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/api/admin/log") {
+        sendJson(response, 200, { entries: adminLogEntries });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/stop") {
+        const stopped = exportQueue.clear();
+        await exportWrite;
+        logAdmin(stopped > 0 ? `Force stopped ${stopped} export job${stopped === 1 ? "" : "s"}` : "Force stop requested with no active jobs", "warn");
+        sendJson(response, 200, { stopped });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/restart") {
+        logAdmin("Resetting server state...", "warn");
+        exportQueue.clear();
+        await exportWrite;
+        mediaRegistry.clear();
+        projects.clear();
+        for (const [projectId, project] of await readProjects(projectsPath)) projects.set(projectId, project);
+        preferences = await readPreferences(preferencesPath);
+        const [resetMediaRoot, resetOutputRoot] = await Promise.all([
+          realpath(path.resolve(preferences.libraryPath ?? configuredRoot)),
+          realpath(path.resolve(preferences.exportPath ?? configuredOutputRoot)),
+        ]);
+        mediaRoot = resetMediaRoot;
+        outputRoot = resetOutputRoot;
+        preferences = { ...preferences, libraryPath: mediaRoot, exportPath: outputRoot };
+        loggedExportStatuses.clear();
+        logAdmin(`Server state reloaded from disk. Library folder: ${mediaRoot}`);
+        sendJson(response, 200, { ok: true, libraryPath: mediaRoot, exportPath: outputRoot });
+        return;
+      }
+
       if (request.method === "DELETE" && url.pathname === "/api/exports") {
         exportQueue.clear();
         await exportWrite;
@@ -866,7 +938,13 @@ export async function createApp(options = {}) {
           realpath(nextPreferences.libraryPath),
           realpath(nextPreferences.exportPath),
         ]);
-        if (nextMediaRoot !== mediaRoot) mediaRegistry.clear();
+        if (nextMediaRoot !== mediaRoot) {
+          mediaRegistry.clear();
+          logAdmin(`Library folder changed to ${nextMediaRoot}; registered media cleared`, "warn");
+        }
+        if (nextOutputRoot !== outputRoot) {
+          logAdmin(`Export folder changed to ${nextOutputRoot}`, "warn");
+        }
         mediaRoot = nextMediaRoot;
         outputRoot = nextOutputRoot;
         preferences = {
@@ -875,6 +953,7 @@ export async function createApp(options = {}) {
           exportPath: outputRoot,
         };
         await persistPreferences();
+        logAdmin("Preferences saved");
         sendJson(response, 200, preferences);
         return;
       }
@@ -988,6 +1067,7 @@ export async function createApp(options = {}) {
         const project = { id: randomUUID(), ...input, createdAt: now, updatedAt: now };
         projects.set(project.id, project);
         await persistProjects();
+        logAdmin(`Project created: ${project.name}`);
         sendJson(response, 201, project);
         return;
       }
@@ -1005,6 +1085,7 @@ export async function createApp(options = {}) {
         const project = { id: randomUUID(), ...input, createdAt: now, updatedAt: now };
         projects.set(project.id, project);
         await persistProjects();
+        logAdmin(`Project imported: ${project.name}`);
         sendJson(response, 201, project);
         return;
       }
@@ -1060,6 +1141,7 @@ export async function createApp(options = {}) {
         };
         projects.set(project.id, project);
         await persistProjects();
+        logAdmin(`Project updated: ${project.name}`);
         sendJson(response, 200, project);
         return;
       }
@@ -1069,18 +1151,20 @@ export async function createApp(options = {}) {
           sendJson(response, 404, { error: "Project not found" });
           return;
         }
+        const deletedName = projects.get(projectMatch[1]).name;
         projects.delete(projectMatch[1]);
         await persistProjects();
+        logAdmin(`Project deleted: ${deletedName}`, "warn");
         response.writeHead(204, { "Cache-Control": "no-store" });
         response.end();
         return;
       }
 
       if (request.method === "GET" && url.pathname === "/api/files") {
-        sendJson(response, 200, {
-          mediaRoot,
-          files: await scanMp4Files(mediaRoot),
-        });
+        logAdmin(`Scanning library folder ${mediaRoot}...`);
+        const files = await scanMp4Files(mediaRoot);
+        logAdmin(`Library scan found ${files.length} MP4 file${files.length === 1 ? "" : "s"}`);
+        sendJson(response, 200, { mediaRoot, files });
         return;
       }
 

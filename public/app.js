@@ -75,6 +75,12 @@ const panelTabs = [...document.querySelectorAll("[data-panel-tab]")];
 const panelContents = [...document.querySelectorAll("[data-panel-content]")];
 const toggleSidebarButton = document.querySelector("#toggle-sidebar");
 const openPreferencesButton = document.querySelector("#open-preferences");
+const openAdminButton = document.querySelector("#open-admin");
+const adminDialog = document.querySelector("#admin-dialog");
+const closeAdminButton = document.querySelector("#close-admin");
+const adminLogElement = document.querySelector("#admin-log");
+const adminStopButton = document.querySelector("#admin-stop");
+const adminRestartButton = document.querySelector("#admin-restart");
 const preferencesDialog = document.querySelector("#preferences-dialog");
 const preferencesForm = document.querySelector("#preferences-form");
 const closePreferencesButton = document.querySelector("#close-preferences");
@@ -1058,6 +1064,96 @@ async function startExportQueue() {
     notice.textContent = error.message;
   }
 }
+
+let adminLogTimer = null;
+
+function formatLogTime(iso) {
+  return iso.slice(11, 19);
+}
+
+function renderAdminLog(entries) {
+  const nearBottom = adminLogElement.scrollHeight - adminLogElement.scrollTop - adminLogElement.clientHeight < 40;
+  adminLogElement.replaceChildren();
+  if (!entries || entries.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "log-empty";
+    empty.textContent = "No server activity recorded yet.";
+    adminLogElement.append(empty);
+    return;
+  }
+  for (const entry of entries) {
+    const line = document.createElement("div");
+    const time = document.createElement("span");
+    line.className = `log-entry${entry.level === "info" ? "" : ` log-${entry.level}`}`;
+    time.className = "log-time";
+    time.textContent = formatLogTime(entry.at);
+    line.append(time, document.createTextNode(entry.message));
+    adminLogElement.append(line);
+  }
+  if (nearBottom) adminLogElement.scrollTop = adminLogElement.scrollHeight;
+}
+
+async function refreshAdminLog() {
+  try {
+    const result = await request("/api/admin/log");
+    renderAdminLog(result.entries);
+  } catch {
+    renderAdminLog([]);
+  }
+}
+
+function openAdminConsole() {
+  if (adminDialog.open) return;
+  adminDialog.showModal();
+  refreshAdminLog();
+  adminLogTimer = window.setInterval(refreshAdminLog, 1000);
+}
+
+function closeAdminConsole() {
+  if (adminDialog.open) adminDialog.close();
+}
+
+adminDialog.addEventListener("close", () => {
+  if (adminLogTimer) {
+    window.clearInterval(adminLogTimer);
+    adminLogTimer = null;
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!adminDialog.open || capturingActionId) return;
+  if (event.composedPath().includes(adminDialog)) return;
+  closeAdminConsole();
+});
+closeAdminButton.addEventListener("click", closeAdminConsole);
+
+async function forceStopServerWork() {
+  if (!window.confirm("Force stop all active and paused exports? Partial output is removed; completed files remain.")) return;
+  try {
+    const result = await request("/api/admin/stop", { method: "POST" });
+    notice.textContent = result.stopped > 0 ? `Force stopped ${result.stopped} job${result.stopped === 1 ? "" : "s"}.` : "Nothing was running.";
+    await Promise.all([refreshAdminLog(), refreshExportQueue()]);
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
+async function resetServerState() {
+  if (!window.confirm("Reset the server? Active exports are stopped and projects, preferences, and folders reload from disk.")) return;
+  adminRestartButton.disabled = true;
+  try {
+    await request("/api/admin/restart", { method: "POST" });
+    notice.textContent = "Server state reloaded from disk.";
+    await Promise.all([refreshAdminLog(), refreshLibrary(), refreshProjects(), refreshExportQueue()]);
+  } catch (error) {
+    notice.textContent = error.message;
+  } finally {
+    adminRestartButton.disabled = false;
+  }
+}
+
+adminStopButton.addEventListener("click", forceStopServerWork);
+adminRestartButton.addEventListener("click", resetServerState);
+openAdminButton.addEventListener("click", openAdminConsole);
 
 function activatePanelTab(name) {
   for (const tab of panelTabs) {

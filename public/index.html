@@ -16,6 +16,7 @@
       <div class="masthead-actions">
         <div class="status" id="server-status">Connecting</div>
         <button type="button" id="toggle-sidebar" aria-expanded="false" aria-controls="library-panel">Right panel</button>
+        <button type="button" id="open-admin">Console</button>
         <button type="button" id="open-preferences">Preferences</button>
       </div>
     </header>
@@ -222,6 +223,23 @@
           <button type="button" id="reset-shortcuts">Reset defaults</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="admin-dialog" class="admin-dialog">
+      <div class="preferences-card admin-card">
+        <div class="preferences-heading">
+          <div>
+            <p class="eyebrow">Server activity</p>
+            <h2>Admin console</h2>
+          </div>
+          <button type="button" id="close-admin">Close</button>
+        </div>
+        <div class="admin-log" id="admin-log" role="log" aria-live="polite" aria-label="Server activity log"></div>
+        <div class="preferences-actions">
+          <button type="button" id="admin-stop">Force stop</button>
+          <button type="button" id="admin-restart">Reset server</button>
+        </div>
+      </div>
     </dialog>
 
     <script type="module" src="/app.js"></script>

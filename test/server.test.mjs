@@ -484,3 +484,30 @@ test("restores and clears the persisted export queue", async () => {
   const cleared = await (await fetch(`${baseUrl}/api/exports`)).json();
   assert.deepEqual(cleared.jobs, []);
 });
+
+test("exposes an admin log with stop and reset controls", async () => {
+  const logResponse = await fetch(`${baseUrl}/api/admin/log`);
+  assert.equal(logResponse.status, 200);
+  const { entries } = await logResponse.json();
+  assert.ok(entries.length >= 2);
+  assert.ok(entries.some((entry) => entry.message.includes("Server started")));
+  assert.ok(entries.some((entry) => entry.message.startsWith("Scanning library folder")));
+
+  const stopResponse = await fetch(`${baseUrl}/api/admin/stop`, { method: "POST" });
+  assert.equal(stopResponse.status, 200);
+  const stopResult = await stopResponse.json();
+  assert.equal(typeof stopResult.stopped, "number");
+  const stopLog = await (await fetch(`${baseUrl}/api/admin/log`)).json();
+  assert.ok(stopLog.entries.some((entry) => entry.message.includes("Force stop")));
+
+  const restartResponse = await fetch(`${baseUrl}/api/admin/restart`, { method: "POST" });
+  assert.equal(restartResponse.status, 200);
+  const restartResult = await restartResponse.json();
+  assert.ok(restartResult.libraryPath);
+
+  const afterLog = await (await fetch(`${baseUrl}/api/admin/log`)).json();
+  assert.ok(afterLog.entries.some((entry) => entry.message.includes("reloaded from disk")));
+
+  const projectsAfter = await (await fetch(`${baseUrl}/api/projects`)).json();
+  assert.ok(Array.isArray(projectsAfter.projects));
+});
