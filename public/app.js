@@ -234,6 +234,22 @@ function snapToKeyframe(timestampUs) {
   return bestDelta <= 80_000 ? best : timestampUs;
 }
 
+function nearestInSorted(arr, targetUs) {
+  if (arr.length === 0) return targetUs;
+  let low = 0;
+  let high = arr.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (arr[middle] < targetUs) low = middle + 1;
+    else high = middle;
+  }
+  const before = arr[low - 1];
+  const after = arr[low];
+  if (!Number.isFinite(before)) return Number.isFinite(after) ? after : targetUs;
+  if (!Number.isFinite(after)) return before;
+  return Math.abs(before - targetUs) <= Math.abs(after - targetUs) ? before : after;
+}
+
 function sequenceKeyframesUs() {
   if (editMode !== "remove") return keyframesUs;
   const result = [];
@@ -506,9 +522,13 @@ function setSequencePlayhead(timestampUs) {
 function seekBySeconds(seconds) {
   if (!currentMedia) return;
   if (editMode === "remove") {
-    setSequencePlayhead(sequencePlayheadUs + seconds * 1_000_000);
+    const targetUs = sequencePlayheadUs + seconds * 1_000_000;
+    const snappedUs = nearestInSorted(sequenceKeyframesUs(), targetUs);
+    setSequencePlayhead(snappedUs);
   } else {
-    video.currentTime = Math.min(Math.max(video.currentTime + seconds, 0), video.duration || 0);
+    const targetUs = (video.currentTime + seconds) * 1_000_000;
+    const snappedUs = nearestInSorted(keyframesUs, Math.max(0, Math.min(targetUs, (video.duration || 0) * 1_000_000)));
+    video.currentTime = snappedUs / 1_000_000;
   }
 }
 

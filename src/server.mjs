@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, open as openFile, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -156,21 +156,182 @@ function fractionToNumber(value) {
   return numerator / denominator;
 }
 
+// ---------------------------------------------------------------------------
+// MP4 container keyframe indexer
+// Reads stss (sync samples), stts (time-to-sample), and mdhd (timescale)
+// directly from the MP4 atom tree without ffprobe.
+// ---------------------------------------------------------------------------
+
+function parseAtomHeader(buf, offset) {
+  if (offset + 8 > buf.length) return null;
+  const size = buf.readUInt32BE(offset);
+  const type = buf.toString("ascii", offset + 4, offset + 8);
+  let headerSize = 8;
+  let dataSize;
+  if (size === 1) {
+    if (offset + 16 > buf.length) return null;
+    headerSize = 16;
+    dataSize = Number(buf.readBigUInt64BE(offset + 8)) - 16;
+  } else if (size === 0) {
+    dataSize = buf.length - offset - 8;
+  } else {
+    dataSize = size - 8;
+  }
+  if (dataSize < 0) return null;
+  return { type, size, headerSize, dataOffset: offset + headerSize, dataSize };
+}
+
+function findAtom(buf, startOffset, endOffset, targetType) {
+  let pos = startOffset;
+  while (pos + 8 <= endOffset) {
+    const atom = parseAtomHeader(buf, pos);
+    if (!atom || atom.size <= 0) break;
+    if (atom.type === targetType) return atom;
+    pos += atom.size;
+  }
+  return null;
+}
+
+function readMdhdTimescale(buf, dataOffset) {
+  if (dataOffset + 4 > buf.length) return null;
+  const version = buf[dataOffset];
+  const timescaleOffset = dataOffset + (version === 1 ? 20 : 12);
+  if (timescaleOffset + 4 > buf.length) return null;
+  return buf.readUInt32BE(timescaleOffset) || null;
+}
+
+function readStssSamples(buf, dataOffset) {
+  if (dataOffset + 8 > buf.length) return [];
+  const entryCount = buf.readUInt32BE(dataOffset + 4);
+  const samples = [];
+  for (let i = 0; i < entryCount; i++) {
+    const off = dataOffset + 8 + i * 4;
+    if (off + 4 > buf.length) break;
+    samples.push(buf.readUInt32BE(off));
+  }
+  return samples;
+}
+
+function computeKeyframesUsFromStts(buf, dataOffset, keyframeSamples, timescale) {
+  if (keyframeSamples.length === 0 || timescale <= 0) return [];
+  if (dataOffset + 8 > buf.length) return [];
+  const entryCount = buf.readUInt32BE(dataOffset + 4);
+
+  const sorted = [...keyframeSamples].sort((a, b) => a - b);
+  const resultMap = new Map();
+  let processedSamples = 0;
+  let accumulatedTicks = 0;
+  let sortIdx = 0;
+  let pos = dataOffset + 8;
+
+  for (let e = 0; e < entryCount && sortIdx < sorted.length; e++) {
+    if (pos + 8 > buf.length) break;
+    const count = buf.readUInt32BE(pos);
+    const delta = buf.readUInt32BE(pos + 4);
+    pos += 8;
+
+    const entryEnd = processedSamples + count;
+    while (sortIdx < sorted.length && sorted[sortIdx] <= entryEnd) {
+      const sampleNum = sorted[sortIdx];
+      const offset = sampleNum - processedSamples - 1;
+      const ticks = accumulatedTicks + offset * delta;
+      resultMap.set(sampleNum, Math.round((ticks / timescale) * 1_000_000));
+      sortIdx++;
+    }
+
+    processedSamples = entryEnd;
+    accumulatedTicks += count * delta;
+  }
+
+  return [...resultMap.values()].sort((a, b) => a - b);
+}
+
+async function indexKeyframesFromMp4(filePath) {
+  const fd = await openFile(filePath, "r");
+  try {
+    const fileSize = (await fd.stat()).size;
+    let moovOffset = null;
+    let moovSize = null;
+    let pos = 0;
+
+    while (pos + 8 <= fileSize) {
+      const headerBuf = Buffer.alloc(8);
+      await fd.read(headerBuf, 0, 8, pos);
+      const size = headerBuf.readUInt32BE(0);
+      const type = headerBuf.toString("ascii", 4, 8);
+      if (size === 1) {
+        const extBuf = Buffer.alloc(8);
+        await fd.read(extBuf, 0, 8, pos + 8);
+        moovSize = Number(extBuf.readBigUInt64BE(0));
+      } else if (size === 0) {
+        moovSize = fileSize - pos;
+      } else {
+        moovSize = size;
+      }
+      if (type === "moov") {
+        moovOffset = pos;
+        break;
+      }
+      if (moovSize <= 0) break;
+      pos += moovSize;
+    }
+    if (moovOffset === null) return null;
+
+    const moovBuf = Buffer.alloc(moovSize);
+    await fd.read(moovBuf, 0, moovSize, moovOffset);
+
+    let trakAtom = null;
+    let searchPos = 8;
+    while (searchPos + 8 <= moovSize) {
+      const atom = parseAtomHeader(moovBuf, searchPos);
+      if (!atom || atom.size <= 0) break;
+      if (atom.type === "trak") {
+        const mdia = findAtom(moovBuf, atom.dataOffset, atom.dataOffset + atom.dataSize, "mdia");
+        if (mdia) {
+          const hdlr = findAtom(moovBuf, mdia.dataOffset, mdia.dataOffset + mdia.dataSize, "hdlr");
+          if (hdlr && hdlr.dataOffset + 12 <= moovBuf.length) {
+            const handlerType = moovBuf.toString("ascii", hdlr.dataOffset + 8, hdlr.dataOffset + 12);
+            if (handlerType === "vide") {
+              trakAtom = atom;
+              break;
+            }
+          }
+        }
+      }
+      searchPos += atom.size;
+    }
+    if (!trakAtom) return null;
+
+    const mdiaAtom = findAtom(moovBuf, trakAtom.dataOffset, trakAtom.dataOffset + trakAtom.dataSize, "mdia");
+    if (!mdiaAtom) return null;
+
+    const mdhdAtom = findAtom(moovBuf, mdiaAtom.dataOffset, mdiaAtom.dataOffset + mdiaAtom.dataSize, "mdhd");
+    if (!mdhdAtom) return null;
+    const timescale = readMdhdTimescale(moovBuf, mdhdAtom.dataOffset);
+    if (!timescale) return null;
+
+    const minfAtom = findAtom(moovBuf, mdiaAtom.dataOffset, mdiaAtom.dataOffset + mdiaAtom.dataSize, "minf");
+    if (!minfAtom) return null;
+    const stblAtom = findAtom(moovBuf, minfAtom.dataOffset, minfAtom.dataOffset + minfAtom.dataSize, "stbl");
+    if (!stblAtom) return null;
+
+    const stssAtom = findAtom(moovBuf, stblAtom.dataOffset, stblAtom.dataOffset + stblAtom.dataSize, "stss");
+    const sttsAtom = findAtom(moovBuf, stblAtom.dataOffset, stblAtom.dataOffset + stblAtom.dataSize, "stts");
+    if (!stssAtom || !sttsAtom) return null;
+
+    const keyframeSamples = readStssSamples(moovBuf, stssAtom.dataOffset);
+    const keyframesUs = computeKeyframesUsFromStts(moovBuf, sttsAtom.dataOffset, keyframeSamples, timescale);
+
+    return keyframesUs.length > 0 ? keyframesUs : null;
+  } finally {
+    await fd.close();
+  }
+}
+
 async function analyzeMedia(filePath, ffprobePath) {
-  const [probe, frameProbe] = await Promise.all([
-    runFfprobe(filePath, ffprobePath, [
-      "-show_entries",
-      "format=duration,format_name,bit_rate:stream=index,codec_type,codec_name,codec_long_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,duration,sample_rate,channels,channel_layout:stream_tags=rotate",
-    ]),
-    runFfprobe(filePath, ffprobePath, [
-      "-select_streams",
-      "v:0",
-      "-skip_frame",
-      "nokey",
-      "-show_frames",
-      "-show_entries",
-      "frame=best_effort_timestamp_time",
-    ]),
+  const probe = await runFfprobe(filePath, ffprobePath, [
+    "-show_entries",
+    "format=duration,format_name,bit_rate:stream=index,codec_type,codec_name,codec_long_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,duration,sample_rate,channels,channel_layout:stream_tags=rotate",
   ]);
 
   const videoStream = probe.streams?.find((stream) => stream.codec_type === "video");
@@ -180,13 +341,26 @@ async function analyzeMedia(filePath, ffprobePath) {
   const nominalFrameRate = fractionToNumber(videoStream.r_frame_rate);
   const averageFrameRate = fractionToNumber(videoStream.avg_frame_rate);
   const rotationSideData = videoStream.side_data_list?.find((item) => Number.isFinite(item.rotation));
-  const keyframesUs = [
-    ...new Set(
-      (frameProbe.frames ?? [])
-        .map((frame) => Math.round(Number(frame.best_effort_timestamp_time) * 1_000_000))
-        .filter((timestamp) => Number.isSafeInteger(timestamp) && timestamp >= 0),
-    ),
-  ].sort((left, right) => left - right);
+
+  let keyframesUs = await indexKeyframesFromMp4(filePath);
+  if (!keyframesUs) {
+    const frameProbe = await runFfprobe(filePath, ffprobePath, [
+      "-select_streams",
+      "v:0",
+      "-skip_frame",
+      "nokey",
+      "-show_frames",
+      "-show_entries",
+      "frame=best_effort_timestamp_time",
+    ]);
+    keyframesUs = [
+      ...new Set(
+        (frameProbe.frames ?? [])
+          .map((frame) => Math.round(Number(frame.best_effort_timestamp_time) * 1_000_000))
+          .filter((timestamp) => Number.isSafeInteger(timestamp) && timestamp >= 0),
+      ),
+    ].sort((left, right) => left - right);
+  }
 
   return {
     container: probe.format?.format_name ?? null,
@@ -226,7 +400,7 @@ async function analyzeMedia(filePath, ffprobePath) {
 async function readCachedAnalysis(cacheDirectory, mediaId, fileStat) {
   try {
     const cached = JSON.parse(await readFile(path.join(cacheDirectory, `${mediaId}.json`), "utf8"));
-    if (cached.version === 1 && cached.size === fileStat.size && cached.mtimeMs === fileStat.mtimeMs) {
+    if (cached.version === 2 && cached.size === fileStat.size && cached.mtimeMs === fileStat.mtimeMs) {
       return cached.analysis;
     }
   } catch (error) {
@@ -240,7 +414,7 @@ async function writeCachedAnalysis(cacheDirectory, mediaId, fileStat, analysis) 
   const temporaryPath = `${cachePath}.${process.pid}.tmp`;
   await writeFile(
     temporaryPath,
-    JSON.stringify({ version: 1, size: fileStat.size, mtimeMs: fileStat.mtimeMs, analysis }),
+    JSON.stringify({ version: 2, size: fileStat.size, mtimeMs: fileStat.mtimeMs, analysis }),
   );
   await rename(temporaryPath, cachePath);
 }
