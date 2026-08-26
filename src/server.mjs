@@ -21,6 +21,7 @@ const DEFAULT_PREFERENCES = {
   exportPath: null,
   exportNameTemplate: EXPORT_NAME_DEFAULT,
   importSearchPaths: [],
+  onlyFastEdits: false,
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -513,9 +514,9 @@ function validateExportNameTemplate(value) {
   }
   const unknownTokens = [...template.matchAll(/%([a-zA-Z]+)%?/g)]
     .map((match) => match[1])
-    .filter((token) => !["o", "m", "h", "ext"].includes(token));
+    .filter((token) => !["f", "o", "m", "h", "ext"].includes(token));
   if (unknownTokens.length > 0) {
-    const error = new Error(`Unknown template token %${unknownTokens[0]}. Use %o, %m, %h, or %ext.`);
+    const error = new Error(`Unknown template token %${unknownTokens[0]}. Use %f, %o, %m, %h, or %ext.`);
     error.statusCode = 400;
     throw error;
   }
@@ -589,6 +590,7 @@ function validatePreferences(body) {
     exportPath: path.normalize(body.exportPath.trim()),
     exportNameTemplate,
     importSearchPaths,
+    onlyFastEdits: body.onlyFastEdits === true,
     shortcuts,
   };
 }
@@ -687,7 +689,9 @@ function createExportName(project, mode, requestedName, jobId, template = EXPORT
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 48) || "shortcut-export";
+  const originalBase = path.basename(project.source.name, path.extname(project.source.name));
   let name = template
+    .replaceAll("%f", originalBase)
     .replaceAll("%o", slug)
     .replaceAll("%m", mode)
     .replaceAll("%h", jobId.slice(0, 8))
@@ -1084,6 +1088,16 @@ export async function createApp(options = {}) {
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/api/admin/shutdown") {
+        logAdmin("Server shutdown requested...", "warn");
+        const stopped = exportQueue.clear();
+        await exportWrite;
+        sendJson(response, 200, { ok: true, stopped, message: "Server is shutting down" });
+        logAdmin("Server stopped");
+        setTimeout(() => process.exit(0), 300);
+        return;
+      }
+
       if (request.method === "DELETE" && url.pathname === "/api/exports") {
         exportQueue.clear();
         await exportWrite;
@@ -1142,6 +1156,11 @@ export async function createApp(options = {}) {
         }
         if (body.mode !== "fast" && body.mode !== "accurate") {
           const error = new Error("Export mode must be fast or accurate");
+          error.statusCode = 400;
+          throw error;
+        }
+        if (preferences.onlyFastEdits && body.mode === "accurate") {
+          const error = new Error("Frame-accurate export is disabled when only fast edits are allowed");
           error.statusCode = 400;
           throw error;
         }

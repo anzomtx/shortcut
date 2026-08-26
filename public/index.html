@@ -200,7 +200,13 @@
         <label class="preference-field path-preference" for="export-name-template">
           <span>Export filename template</span>
           <input id="export-name-template" type="text" autocomplete="off" spellcheck="false" maxlength="100" />
-          <small>Tokens: %o project name · %m mode · %h short id · %ext extension. Example: <output id="export-name-example"></output></small>
+          <small>Tokens: %f original file · %o project name · %m mode · %h short id · %ext extension. Example: <output id="export-name-example"></output></small>
+        </label>
+
+        <label class="preference-field checkbox-field" for="only-fast-edits">
+          <input id="only-fast-edits" type="checkbox" />
+          <span>Only allow fast encode edits</span>
+          <small>Snaps every mark to a keyframe and disables frame-accurate export, so all edits can be exported without re-encoding.</small>
         </label>
 
         <label class="preference-field path-preference" for="import-search-paths">
@@ -238,6 +244,7 @@
         <div class="preferences-actions">
           <button type="button" id="admin-stop">Force stop</button>
           <button type="button" id="admin-restart">Reset server</button>
+          <button type="button" id="admin-shutdown">Shut down</button>
         </div>
       </div>
     </dialog>

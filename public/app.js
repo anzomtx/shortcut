@@ -14,6 +14,7 @@ const DEFAULT_PREFERENCES = {
   exportPath: "",
   exportNameTemplate: "%o-%m-%h.%ext",
   importSearchPaths: [],
+  onlyFastEdits: false,
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -81,6 +82,7 @@ const closeAdminButton = document.querySelector("#close-admin");
 const adminLogElement = document.querySelector("#admin-log");
 const adminStopButton = document.querySelector("#admin-stop");
 const adminRestartButton = document.querySelector("#admin-restart");
+const adminShutdownButton = document.querySelector("#admin-shutdown");
 const preferencesDialog = document.querySelector("#preferences-dialog");
 const preferencesForm = document.querySelector("#preferences-form");
 const closePreferencesButton = document.querySelector("#close-preferences");
@@ -90,6 +92,7 @@ const exportPathInput = document.querySelector("#export-path");
 const exportNameTemplateInput = document.querySelector("#export-name-template");
 const exportNameExample = document.querySelector("#export-name-example");
 const importSearchPathsInput = document.querySelector("#import-search-paths");
+const onlyFastEditsInput = document.querySelector("#only-fast-edits");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
@@ -232,6 +235,11 @@ function snapToKeyframe(timestampUs) {
     }
   }
   return bestDelta <= 80_000 ? best : timestampUs;
+}
+
+function snapEditPoint(timestampUs) {
+  if (preferences.onlyFastEdits) return nearestInSorted(keyframesUs, timestampUs);
+  return snapToKeyframe(timestampUs);
 }
 
 function nearestInSorted(arr, targetUs) {
@@ -596,7 +604,9 @@ function seekTimeline(clientX) {
 
 function updateExportControls() {
   const hasSegments = Boolean(currentMedia && segments.length > 0);
-  exportAccurateButton.disabled = !hasSegments;
+  const onlyFast = Boolean(preferences.onlyFastEdits);
+  exportAccurateButton.disabled = !hasSegments || onlyFast;
+  exportAccurateButton.hidden = onlyFast;
   exportFastButton.disabled = !hasSegments || segments.some((segment) => !isKeyframe(segment.inUs));
 }
 
@@ -924,6 +934,10 @@ async function saveProject() {
 }
 
 async function beginExport(mode) {
+  if (preferences.onlyFastEdits && mode === "accurate") {
+    notice.textContent = "Frame-accurate export is disabled when only fast edits are allowed.";
+    return;
+  }
   exportFastButton.disabled = true;
   exportAccurateButton.disabled = true;
   notice.textContent = "Saving project before export...";
@@ -1171,8 +1185,20 @@ async function resetServerState() {
   }
 }
 
+async function shutdownServer() {
+  if (!window.confirm("Shut down the server? Active exports are stopped and the process exits. Double-click the launcher to start it again.")) return;
+  adminShutdownButton.disabled = true;
+  try {
+    await request("/api/admin/shutdown", { method: "POST" });
+    notice.textContent = "Server is shutting down.";
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
 adminStopButton.addEventListener("click", forceStopServerWork);
 adminRestartButton.addEventListener("click", resetServerState);
+adminShutdownButton.addEventListener("click", shutdownServer);
 openAdminButton.addEventListener("click", openAdminConsole);
 
 function activatePanelTab(name) {
@@ -1283,6 +1309,7 @@ function renderShortcutEditor() {
 
 function updateExportNameExample() {
   const example = (exportNameTemplateInput.value || DEFAULT_PREFERENCES.exportNameTemplate)
+    .replaceAll("%f", "source-video")
     .replaceAll("%o", "my-project")
     .replaceAll("%m", "fast")
     .replaceAll("%h", "a1b2c3d4")
@@ -1299,6 +1326,7 @@ function openPreferences() {
   exportPathInput.value = preferencesDraft.exportPath;
   exportNameTemplateInput.value = preferencesDraft.exportNameTemplate || DEFAULT_PREFERENCES.exportNameTemplate;
   importSearchPathsInput.value = (preferencesDraft.importSearchPaths ?? []).join("\n");
+  onlyFastEditsInput.checked = Boolean(preferencesDraft.onlyFastEdits);
   updateExportNameExample();
   capturingActionId = null;
   preferencesMessage.textContent = "";
@@ -1317,9 +1345,11 @@ async function savePreferences() {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+  preferencesDraft.onlyFastEdits = onlyFastEditsInput.checked;
   try {
     await persistPreferences(preferencesDraft);
     await refreshLibrary();
+    updateExportControls();
     notice.textContent = "Preferences saved and paths reloaded.";
     return true;
   } catch (error) {
@@ -1352,8 +1382,8 @@ const ACTIONS = [
   ]),
   { id: "edit.modeInclude", label: "Switch to Include mode", group: "Edit", run: () => changeEditMode("include") },
   { id: "edit.modeRemove", label: "Switch to Remove mode", group: "Edit", run: () => changeEditMode("remove") },
-  { id: "edit.markIn", label: "Mark in", group: "Edit", run: () => { markInUs = snapToKeyframe(currentEditTimeUs()); renderMarks(); } },
-  { id: "edit.markOut", label: "Mark out", group: "Edit", run: () => { markOutUs = snapToKeyframe(currentEditTimeUs()); renderMarks(); } },
+  { id: "edit.markIn", label: "Mark in", group: "Edit", run: () => { markInUs = snapEditPoint(currentEditTimeUs()); renderMarks(); } },
+  { id: "edit.markOut", label: "Mark out", group: "Edit", run: () => { markOutUs = snapEditPoint(currentEditTimeUs()); renderMarks(); } },
   { id: "edit.applyRange", label: "Apply marked range", group: "Edit", run: applyMarkedRange },
   { id: "edit.removeSelected", label: "Remove selected clip", group: "Edit", run: removeSelectedSegment },
   { id: "edit.undo", label: "Undo", group: "Edit", run: undoEdit },

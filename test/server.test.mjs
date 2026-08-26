@@ -425,6 +425,66 @@ test("names exports from the filename template preference", async () => {
   await fetch(`${baseUrl}/api/exports/${job.id}/stop`, { method: "POST" });
 });
 
+test("expands the %f original filename token in export names", async () => {
+  assert.ok(savedProject);
+  const templateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...(await (await fetch(`${baseUrl}/api/preferences`)).json()),
+      exportNameTemplate: "%f-%m.%ext",
+    }),
+  });
+  assert.equal(templateResponse.status, 200);
+
+  const createResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId: savedProject.id, mode: "fast" }),
+  });
+  assert.equal(createResponse.status, 202);
+  const job = await createResponse.json();
+  const expectedBase = savedProject.source.name.replace(/\.[^.]+$/, "");
+  assert.equal(job.outputName, `${expectedBase}-fast.mp4`);
+  await fetch(`${baseUrl}/api/exports/${job.id}/stop`, { method: "POST" });
+});
+
+test("onlyFastEdits preference disallows frame-accurate exports", async () => {
+  assert.ok(savedProject);
+  const prefs = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  const updateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, onlyFastEdits: true }),
+  });
+  assert.equal(updateResponse.status, 200);
+  assert.equal((await updateResponse.json()).onlyFastEdits, true);
+
+  const accurateResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId: savedProject.id, mode: "accurate" }),
+  });
+  assert.equal(accurateResponse.status, 400);
+  const accurateError = await accurateResponse.json();
+  assert.match(accurateError.error, /only fast edits/);
+
+  const fastResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId: savedProject.id, mode: "fast" }),
+  });
+  assert.equal(fastResponse.status, 202);
+  const job = await fastResponse.json();
+  await fetch(`${baseUrl}/api/exports/${job.id}/stop`, { method: "POST" });
+
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, onlyFastEdits: false }),
+  });
+});
+
 test("starts all paused exports from the queue", async () => {
   assert.ok(savedProject);
   for (const mode of ["fast", "accurate"]) {

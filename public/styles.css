@@ -951,6 +951,30 @@ video::-webkit-media-controls {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.preference-field.checkbox-field {
+  grid-template-columns: auto 1fr;
+  align-items: start;
+}
+
+.preference-field.checkbox-field input[type="checkbox"] {
+  width: 1.1rem;
+  height: 1.1rem;
+  margin-top: 0.1rem;
+  accent-color: #d1fe3f;
+}
+
+.preference-field.checkbox-field span {
+  line-height: 1.4;
+}
+
+.preference-field.checkbox-field small {
+  grid-column: 2;
+  color: #8f9187;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  font-weight: 400;
+}
+
 .viewer-shell.drop-target::after {
   content: "Drop MP4 to open from disk";
   position: absolute;
