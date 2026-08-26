@@ -160,7 +160,7 @@ async function analyzeMedia(filePath, ffprobePath) {
   const [probe, frameProbe] = await Promise.all([
     runFfprobe(filePath, ffprobePath, [
       "-show_entries",
-      "format=duration,format_name,bit_rate:stream=index,codec_type,codec_name,codec_long_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,duration,sample_rate,channels,channel_layout:stream_tags=rotate:stream_side_data=rotation",
+      "format=duration,format_name,bit_rate:stream=index,codec_type,codec_name,codec_long_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,time_base,duration,sample_rate,channels,channel_layout:stream_tags=rotate",
     ]),
     runFfprobe(filePath, ffprobePath, [
       "-select_streams",
