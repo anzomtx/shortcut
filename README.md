@@ -21,6 +21,7 @@ Shortcut provides:
 - A double-clickable macOS launcher that starts the server and opens the browser
 - Automatic session recovery: edits are autosaved locally and restored after an unexpected crash
 - Crash and client error logging under `logs/`, and a supervisor that restarts the server after a crash
+- Optional half/quarter-resolution preview proxies with dense keyframes for fast seeking on long-GOP files
 
 ## Requirements
 
@@ -56,6 +57,13 @@ On macOS you can double-click `Shortcut Launcher.command` to start the server an
 Edits are autosaved to the browser's local storage after every change, along with the source filename. If the previous session closed without a clean unload (a crash, the browser tab being killed, or the machine losing power), the file and edit list are reloaded automatically. If the session closed cleanly, a **Restore** bar offers to reload the last unsaved session instead.
 
 Client errors, server crashes, and supervisor restarts are recorded as JSON Lines under `logs/` (gitignored) in the repository: `client-errors.jsonl`, `server-errors.jsonl`, and `server-supervisor.log`. The admin console also mirrors client errors as they arrive.
+
+## Preview proxies
+
+Files with long keyframe intervals (large GOP) seek slowly in the browser because each seek decodes from the nearest keyframe. Two options address this:
+
+- **Preview resolution** (Preferences): choose Full, Half, or Quarter resolution. Half/Quarter generate a cached preview proxy (dense ~1s keyframes, fast-start moov) in the background and the browser previews it, with the current progress shown in the status line. Edits and exports always use the source timestamps, so output quality is unaffected. Proxies are cached per source and regenerate only when the source changes.
+- **Keyframe-snapped scrubbing**: when previewing the full-resolution source, dragging/clicking the timeline lands on the nearest source keyframe (like Avidemux coarse scrub) so the browser decodes at most a partial GOP per stop. With a proxy active, scrubbing is precise.
 
 Open <http://127.0.0.1:4173> and click an MP4 filename in the local library, or drop an MP4 anywhere onto the video area — dropped files are located by name on disk and streamed in place, never copied. Files must contain an H.264 video stream.
 

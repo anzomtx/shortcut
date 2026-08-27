@@ -605,3 +605,44 @@ test("logs client errors to the /logs folder", async () => {
   const lastEntry = JSON.parse(logContent2.trim().split("\n").pop());
   assert.equal(lastEntry.level, "info");
 });
+
+test("generates and streams a quarter-resolution preview proxy", async () => {
+  const media = await registerSample();
+  const prefs = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  const updateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewScale: "quarter" }),
+  });
+  assert.equal(updateResponse.status, 200);
+  assert.equal((await updateResponse.json()).previewScale, "quarter");
+
+  const proxyStatus = await (await fetch(`${baseUrl}/api/media/${media.id}/proxy`)).json();
+  assert.equal(proxyStatus.status, "pending");
+
+  const deadline = Date.now() + 30_000;
+  let status = proxyStatus;
+  while (status.status === "pending" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    status = await (await fetch(`${baseUrl}/api/media/${media.id}/proxy`)).json();
+  }
+  assert.equal(status.status, "ready");
+  assert.ok(status.width > 0 && status.height > 0);
+
+  const headResponse = await fetch(`${baseUrl}${status.streamUrl}`, { method: "HEAD" });
+  assert.equal(headResponse.status, 200);
+  assert.equal(headResponse.headers.get("content-type"), "video/mp4");
+  assert.ok(Number(headResponse.headers.get("content-length")) > 0);
+
+  const rangeResponse = await fetch(`${baseUrl}${status.streamUrl}`, {
+    headers: { Range: "bytes=0-99" },
+  });
+  assert.equal(rangeResponse.status, 206);
+  assert.equal(rangeResponse.headers.get("content-range"), "bytes 0-99/" + Number(headResponse.headers.get("content-length")));
+
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewScale: "source" }),
+  });
+});

@@ -15,6 +15,7 @@ const DEFAULT_PREFERENCES = {
   exportNameTemplate: "%o-%m-%h.%ext",
   importSearchPaths: [],
   onlyFastEdits: false,
+  previewScale: "source",
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -93,6 +94,7 @@ const exportNameTemplateInput = document.querySelector("#export-name-template");
 const exportNameExample = document.querySelector("#export-name-example");
 const importSearchPathsInput = document.querySelector("#import-search-paths");
 const onlyFastEditsInput = document.querySelector("#only-fast-edits");
+const previewScaleSelect = document.querySelector("#preview-scale");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
@@ -106,6 +108,8 @@ const CLEAN_CLOSE_KEY = "shortcut.clean-close";
 
 let currentMedia = null;
 let keyframesUs = [];
+let sourceMetadataLine = "";
+let previewIsProxy = false;
 let markInUs = 0;
 let markOutUs = 0;
 let segments = [];
@@ -653,8 +657,11 @@ function seekTimeline(clientX) {
   const bounds = timeline.getBoundingClientRect();
   const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
   const targetUs = ratio * timelineDurationUs();
-  if (editMode === "remove") setSequencePlayhead(targetUs);
-  else video.currentTime = targetUs / 1_000_000;
+  const snappedUs = previewIsProxy
+    ? targetUs
+    : nearestInSorted(editMode === "remove" ? sequenceKeyframesUs() : keyframesUs, targetUs);
+  if (editMode === "remove") setSequencePlayhead(snappedUs);
+  else video.currentTime = snappedUs / 1_000_000;
 }
 
 function updateExportControls() {
@@ -699,6 +706,73 @@ function reportClientError(level, message, context) {
   }
 }
 
+function applyPreviewSource(proxy) {
+  previewIsProxy = true;
+  const keepTime = video.currentTime;
+  video.src = proxy.streamUrl;
+  if (Number.isFinite(keepTime) && keepTime > 0) {
+    video.addEventListener("loadedmetadata", () => {
+      video.currentTime = keepTime;
+    }, { once: true });
+  }
+  video.load();
+  const label = proxy.scale === "half" ? "Half" : "Quarter";
+  metadata.textContent = `${sourceMetadataLine} · ${label}-res preview (${proxy.width}x${proxy.height})`;
+}
+
+async function waitForProxy(media) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    let proxy;
+    try {
+      proxy = await request(`/api/media/${media.id}/proxy`);
+    } catch {
+      return;
+    }
+    if (proxy.status === "ready") {
+      applyPreviewSource(proxy);
+      notice.textContent = "Preview proxy ready.";
+      return;
+    }
+    if (proxy.status === "failed") {
+      notice.textContent = `Preview proxy failed: ${proxy.error ?? "unknown"}`;
+      return;
+    }
+    if (proxy.status === "pending" && Number.isFinite(proxy.progress)) {
+      notice.textContent = `Generating ${proxy.scale === "half" ? "half" : "quarter"}-res preview... ${Math.round(proxy.progress)}%`;
+    }
+  }
+}
+
+async function configurePreview(media) {
+  const scale = preferences.previewScale;
+  if (!scale || scale === "source") {
+    previewIsProxy = false;
+    video.src = media.streamUrl;
+    video.load();
+    metadata.textContent = sourceMetadataLine;
+    return;
+  }
+  try {
+    const proxy = await request(`/api/media/${media.id}/proxy`);
+    if (proxy.status === "ready") {
+      applyPreviewSource(proxy);
+      notice.textContent = `${proxy.scale === "half" ? "Half" : "Quarter"}-res preview ready.`;
+      return;
+    }
+    if (proxy.status === "pending") {
+      notice.textContent = "Generating preview proxy...";
+      await waitForProxy(media);
+      return;
+    }
+    notice.textContent = `Preview proxy unavailable: ${proxy.error ?? "unknown"}`;
+  } catch {
+    video.src = media.streamUrl;
+    video.load();
+    metadata.textContent = sourceMetadataLine;
+  }
+}
+
 function adoptMedia(media, keyframes) {
   currentMedia = media;
   keyframesUs = keyframes;
@@ -710,7 +784,8 @@ function adoptMedia(media, keyframes) {
   video.load();
   viewerEmpty.hidden = true;
   viewerTitle.textContent = media.name;
-  metadata.textContent = `${media.video.width}x${media.video.height} · ${formatDuration(media.durationUs / 1_000_000)} · ${media.video.averageFrameRate?.toFixed(3) ?? "?"} fps · ${formatBytes(media.size)}`;
+  sourceMetadataLine = `${media.video.width}x${media.video.height} · ${formatDuration(media.durationUs / 1_000_000)} · ${media.video.averageFrameRate?.toFixed(3) ?? "?"} fps · ${formatBytes(media.size)}`;
+  metadata.textContent = sourceMetadataLine;
   currentProjectId = null;
   projectName.value = `${media.name.replace(/\.mp4$/i, "")} edit`;
   selectedMediaPath = media.relativePath ?? selectedMediaPath;
@@ -735,6 +810,7 @@ async function loadMedia(locator, button) {
     });
     const keyframeIndex = await request(media.keyframesUrl);
     adoptMedia(media, keyframeIndex.keyframesUs);
+    configurePreview(media);
     return true;
   } catch (error) {
     notice.textContent = error.message;
@@ -755,6 +831,7 @@ async function loadLocatedMedia(name, button) {
     });
     const keyframeIndex = await request(media.keyframesUrl);
     adoptMedia(media, keyframeIndex.keyframesUs);
+    configurePreview(media);
     return true;
   } catch (error) {
     notice.textContent = error.message;
@@ -1394,6 +1471,7 @@ function openPreferences() {
   exportNameTemplateInput.value = preferencesDraft.exportNameTemplate || DEFAULT_PREFERENCES.exportNameTemplate;
   importSearchPathsInput.value = (preferencesDraft.importSearchPaths ?? []).join("\n");
   onlyFastEditsInput.checked = Boolean(preferencesDraft.onlyFastEdits);
+  previewScaleSelect.value = preferencesDraft.previewScale ?? "source";
   updateExportNameExample();
   capturingActionId = null;
   preferencesMessage.textContent = "";
@@ -1413,10 +1491,12 @@ async function savePreferences() {
     .map((line) => line.trim())
     .filter(Boolean);
   preferencesDraft.onlyFastEdits = onlyFastEditsInput.checked;
+  preferencesDraft.previewScale = previewScaleSelect.value || "source";
   try {
     await persistPreferences(preferencesDraft);
     await refreshLibrary();
     updateExportControls();
+    if (currentMedia) configurePreview(currentMedia);
     notice.textContent = "Preferences saved and paths reloaded.";
     return true;
   } catch (error) {
@@ -1529,6 +1609,21 @@ document.addEventListener("pointerdown", (event) => {
   saveAndClosePreferences();
 });
 exportNameTemplateInput.addEventListener("input", updateExportNameExample);
+previewScaleSelect.addEventListener("change", async () => {
+  preferences.previewScale = previewScaleSelect.value;
+  try {
+    await persistPreferences({ ...preferences });
+    updateExportControls();
+    if (currentMedia) {
+      notice.textContent = previewScaleSelect.value === "source"
+        ? "Previewing full resolution."
+        : `Previewing ${previewScaleSelect.value} resolution...`;
+      configurePreview(currentMedia);
+    }
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+});
 timeline.addEventListener("pointerdown", (event) => seekTimeline(event.clientX));
 timeline.addEventListener("keydown", (event) => {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;

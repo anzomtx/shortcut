@@ -277,6 +277,44 @@ main.sidebar-collapsed {
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
 }
 
+.preview-scale-control {
+  position: absolute;
+  top: 0.65rem;
+  right: 0.65rem;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid #4a4c40;
+  border-radius: 0.45rem;
+  background: rgba(20, 21, 17, 0.82);
+  backdrop-filter: blur(3px);
+  color: #c9cbbf;
+  font-size: 0.72rem;
+}
+
+.preview-scale-control span {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 650;
+  color: #8f9187;
+}
+
+.preview-scale-control select {
+  background: transparent;
+  border: 0;
+  color: #e8e7df;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.preview-scale-control select option {
+  background: #1a1b16;
+  color: #e8e7df;
+}
+
 .transport {
   display: grid;
   grid-template-columns: 1fr auto 1fr;

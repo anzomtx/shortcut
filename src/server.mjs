@@ -23,6 +23,7 @@ const DEFAULT_PREFERENCES = {
   exportNameTemplate: EXPORT_NAME_DEFAULT,
   importSearchPaths: [],
   onlyFastEdits: false,
+  previewScale: "source",
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -123,6 +124,38 @@ async function scanMp4Files(root, directory = root) {
   }
 
   return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      ffmpegPath,
+      ["-v", "error", "-y", "-i", sourcePath, ...args, outputPath],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const stderr = [];
+    let progress = 0;
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.stdout.on("data", (chunk) => {
+      if (!onProgress) return;
+      const text = chunk.toString("utf8");
+      for (const line of text.split("\n")) {
+        const match = /^out_time_ms=(\d+)$/.exec(line);
+        if (match) {
+          progress = Number(match[1]) / 1_000_000;
+          onProgress(progress);
+        }
+      }
+    });
+    child.on("error", (error) => reject(new Error(`Unable to run ffmpeg: ${error.message}`)));
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || "ffmpeg failed"));
+        return;
+      }
+      resolve(progress);
+    });
+  });
 }
 
 function runFfprobe(filePath, ffprobePath, args) {
@@ -601,6 +634,7 @@ function validatePreferences(body) {
     exportNameTemplate,
     importSearchPaths,
     onlyFastEdits: body.onlyFastEdits === true,
+    previewScale: body.previewScale === "half" || body.previewScale === "quarter" ? body.previewScale : "source",
     shortcuts,
   };
 }
@@ -793,12 +827,12 @@ function parseRange(header, size) {
   return { start, end };
 }
 
-async function streamMedia(request, response, media) {
-  const fileStat = await stat(media.path);
+async function streamFile(request, response, filePath, contentType) {
+  const fileStat = await stat(filePath);
   const range = parseRange(request.headers.range, fileStat.size);
   const headers = {
     "Accept-Ranges": "bytes",
-    "Content-Type": "video/mp4",
+    "Content-Type": contentType,
     "Cache-Control": "private, no-cache",
     "X-Content-Type-Options": "nosniff",
   };
@@ -821,9 +855,13 @@ async function streamMedia(request, response, media) {
     return;
   }
 
-  const stream = createReadStream(media.path, { start, end });
+  const stream = createReadStream(filePath, { start, end });
   stream.on("error", () => response.destroy());
   stream.pipe(response);
+}
+
+async function streamMedia(request, response, media) {
+  return streamFile(request, response, media.path, "video/mp4");
 }
 
 export async function createApp(options = {}) {
@@ -836,6 +874,7 @@ export async function createApp(options = {}) {
   const ffprobePath = options.ffprobePath ?? process.env.FFPROBE_PATH ?? "ffprobe";
   const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH ?? "ffmpeg";
   const cacheDirectory = path.join(dataRoot, "metadata");
+  const proxyDirectory = path.join(dataRoot, "proxies");
   const exportWorkRoot = path.join(dataRoot, "export-work");
   const projectsPath = path.join(dataRoot, "projects.json");
   const preferencesPath = path.join(dataRoot, "preferences.json");
@@ -843,6 +882,7 @@ export async function createApp(options = {}) {
   await Promise.all([
     mkdir(configuredRoot, { recursive: true }),
     mkdir(cacheDirectory, { recursive: true }),
+    mkdir(proxyDirectory, { recursive: true }),
     mkdir(configuredOutputRoot, { recursive: true }),
     mkdir(exportWorkRoot, { recursive: true }),
   ]);
@@ -910,6 +950,126 @@ export async function createApp(options = {}) {
     return exportWrite;
   }
 
+  const proxyTasks = new Map();
+
+  function proxyDimensions(media, scale) {
+    const divisor = scale === "quarter" ? 4 : 2;
+    const width = media.analysis.video.width;
+    const height = media.analysis.video.height;
+    return {
+      width: Math.max(2, Math.round(width / divisor / 2) * 2),
+      height: Math.max(2, Math.round(height / divisor / 2) * 2),
+    };
+  }
+
+  function proxyFilePath(mediaId, scale) {
+    return path.join(proxyDirectory, `${mediaId}-${scale}.mp4`);
+  }
+
+  function proxySidecarPath(mediaId, scale) {
+    return path.join(proxyDirectory, `${mediaId}-${scale}.json`);
+  }
+
+  async function readProxySidecar(mediaId, scale) {
+    try {
+      return JSON.parse(await readFile(proxySidecarPath(mediaId, scale), "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  async function isProxyCurrent(media, scale) {
+    const [sidecar, proxyStat] = await Promise.all([
+      readProxySidecar(media.id, scale),
+      stat(proxyFilePath(media.id, scale)).catch(() => null),
+    ]);
+    return Boolean(
+      proxyStat &&
+        sidecar &&
+        sidecar.sourceSize === media.size &&
+        sidecar.sourceMtimeMs === media.mtimeMs &&
+        sidecar.scale === scale,
+    );
+  }
+
+  async function ensureProxy(media, scale) {
+    const key = `${media.id}:${scale}`;
+    if (proxyTasks.has(key)) return proxyTasks.get(key).task;
+    const task = { status: "pending", progress: 0, error: null, dims: null, promise: null };
+    task.promise = (async () => {
+      try {
+        if (await isProxyCurrent(media, scale)) {
+          const sidecar = await readProxySidecar(media.id, scale);
+          task.status = "ready";
+          task.dims = { width: sidecar.width, height: sidecar.height };
+          return task;
+        }
+        await mkdir(proxyDirectory, { recursive: true });
+        const dims = proxyDimensions(media, scale);
+        const gop = Math.max(1, Math.round(media.analysis.video.averageFrameRate ?? 30));
+        const tempPath = `${proxyFilePath(media.id, scale)}.${process.pid}.tmp`;
+        logAdmin(`Generating ${scale}-res proxy for ${media.name}...`);
+        const progressSeconds = await runFfmpegToFile({
+          sourcePath: media.path,
+          outputPath: tempPath,
+          ffmpegPath,
+          args: [
+            "-vf",
+            `scale=${dims.width}:${dims.height}`,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-g",
+            String(gop),
+            "-keyint_min",
+            String(gop),
+            "-sc_threshold",
+            "0",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-f",
+            "mp4",
+          ],
+          onProgress: (seconds) => {
+            const duration = media.analysis.durationUs / 1_000_000;
+            task.progress = duration > 0 ? Math.min(0.99, seconds / duration) : 0;
+          },
+        });
+        await rename(tempPath, proxyFilePath(media.id, scale));
+        await writeFile(
+          proxySidecarPath(media.id, scale),
+          JSON.stringify({
+            sourceSize: media.size,
+            sourceMtimeMs: media.mtimeMs,
+            scale,
+            width: dims.width,
+            height: dims.height,
+            gop,
+          }),
+        );
+        task.status = "ready";
+        task.progress = 1;
+        task.dims = { width: dims.width, height: dims.height };
+        logAdmin(`Generated ${scale}-res proxy for ${media.name} (${dims.width}x${dims.height}, ${gop}f keyframes)`);
+      } catch (error) {
+        task.status = "failed";
+        task.error = error.message;
+        logAdmin(`Proxy generation failed for ${media.name}: ${error.message}`, "error");
+      }
+      return task;
+    })();
+    proxyTasks.set(key, { task });
+    task.promise.catch(() => {});
+    return task;
+  }
+
   async function registerMediaByPath(resolvedPath) {
     const filePath = await realpath(resolvedPath);
     const fileStat = await stat(filePath);
@@ -940,10 +1100,14 @@ export async function createApp(options = {}) {
       absolutePath: filePath,
       path: filePath,
       size: fileStat.size,
+      mtimeMs: fileStat.mtimeMs,
       analysis,
     };
     mediaRegistry.set(id, media);
     logAdmin(`Registered ${media.name} (${keyframeLabel(analysis)})`);
+    if (preferences.previewScale !== "source") {
+      ensureProxy(media, preferences.previewScale).catch(() => {});
+    }
     return media;
   }
 
@@ -1167,6 +1331,11 @@ export async function createApp(options = {}) {
           exportPath: outputRoot,
         };
         await persistPreferences();
+        if (preferences.previewScale !== "source") {
+          for (const media of mediaRegistry.values()) {
+            ensureProxy(media, preferences.previewScale).catch(() => {});
+          }
+        }
         logAdmin("Preferences saved");
         sendJson(response, 200, preferences);
         return;
@@ -1451,6 +1620,47 @@ export async function createApp(options = {}) {
           return;
         }
         await streamMedia(request, response, media);
+        return;
+      }
+
+      const proxyStatusMatch = /^\/api\/media\/([a-f0-9]{24})\/proxy$/.exec(url.pathname);
+      if (request.method === "GET" && proxyStatusMatch) {
+        const media = mediaRegistry.get(proxyStatusMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        const scale = preferences.previewScale ?? "source";
+        if (scale === "source") {
+          sendJson(response, 200, { status: "off", scale });
+          return;
+        }
+        const task = await ensureProxy(media, scale);
+        sendJson(response, 200, {
+          status: task.status,
+          scale,
+          progress: task.status === "pending" ? Math.round(task.progress * 100) : null,
+          error: task.error ?? null,
+          width: task.dims?.width ?? null,
+          height: task.dims?.height ?? null,
+          streamUrl: `/api/media/${media.id}/proxy/stream`,
+        });
+        return;
+      }
+
+      const proxyStreamMatch = /^\/api\/media\/([a-f0-9]{24})\/proxy\/stream$/.exec(url.pathname);
+      if ((request.method === "GET" || request.method === "HEAD") && proxyStreamMatch) {
+        const media = mediaRegistry.get(proxyStreamMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        const scale = preferences.previewScale ?? "source";
+        if (scale === "source") {
+          sendJson(response, 404, { error: "No preview proxy is enabled" });
+          return;
+        }
+        await streamFile(request, response, proxyFilePath(media.id, scale), "video/mp4");
         return;
       }
 
