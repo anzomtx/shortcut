@@ -646,3 +646,48 @@ test("generates and streams a quarter-resolution preview proxy", async () => {
     body: JSON.stringify({ ...prefs, previewScale: "source" }),
   });
 });
+
+test("extracts and serves keyframe stills for long-GOP files", async () => {
+  const longPath = path.join(temporaryDirectory, "long-gop.mp4");
+  await execFileAsync("ffmpeg", [
+    "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30",
+    "-t", "10",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    "-g", "90", "-keyint_min", "90", "-sc_threshold", "0",
+    longPath,
+  ]);
+
+  const registerResponse = await fetch(`${baseUrl}/api/media`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ relativePath: "long-gop.mp4" }),
+  });
+  assert.equal(registerResponse.status, 201);
+  const media = await registerResponse.json();
+  assert.ok(media.keyframeCount >= 3);
+
+  const stillsResponse = await fetch(`${baseUrl}/api/media/${media.id}/stills`);
+  assert.equal(stillsResponse.status, 200);
+  const initial = await stillsResponse.json();
+  assert.equal(initial.status, "pending");
+
+  const deadline = Date.now() + 30_000;
+  let status = initial;
+  while (status.status === "pending" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    status = await (await fetch(`${baseUrl}/api/media/${media.id}/stills`)).json();
+  }
+  assert.equal(status.status, "ready");
+  assert.equal(status.count, media.keyframeCount);
+
+  const stillResponse = await fetch(`${baseUrl}/api/media/${media.id}/still/0`);
+  assert.equal(stillResponse.status, 200);
+  assert.equal(stillResponse.headers.get("content-type"), "image/jpeg");
+  const bytes = Buffer.from(await stillResponse.arrayBuffer());
+  assert.equal(bytes[0], 0xff);
+  assert.equal(bytes[1], 0xd8);
+
+  const missingResponse = await fetch(`${baseUrl}/api/media/${media.id}/still/9999`);
+  assert.equal(missingResponse.status, 404);
+});

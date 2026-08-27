@@ -875,6 +875,7 @@ export async function createApp(options = {}) {
   const ffmpegPath = options.ffmpegPath ?? process.env.FFMPEG_PATH ?? "ffmpeg";
   const cacheDirectory = path.join(dataRoot, "metadata");
   const proxyDirectory = path.join(dataRoot, "proxies");
+  const stillRoot = path.join(dataRoot, "stills");
   const exportWorkRoot = path.join(dataRoot, "export-work");
   const projectsPath = path.join(dataRoot, "projects.json");
   const preferencesPath = path.join(dataRoot, "preferences.json");
@@ -883,6 +884,7 @@ export async function createApp(options = {}) {
     mkdir(configuredRoot, { recursive: true }),
     mkdir(cacheDirectory, { recursive: true }),
     mkdir(proxyDirectory, { recursive: true }),
+    mkdir(stillRoot, { recursive: true }),
     mkdir(configuredOutputRoot, { recursive: true }),
     mkdir(exportWorkRoot, { recursive: true }),
   ]);
@@ -1073,6 +1075,77 @@ export async function createApp(options = {}) {
     return task;
   }
 
+  function hasLargeKeyframeGaps(media) {
+    const keyframes = media.analysis.keyframesUs;
+    return keyframes.length > 1 && keyframes.some((timestamp, index) => index > 0 && timestamp - keyframes[index - 1] > 1_500_000);
+  }
+
+  const stillTasks = new Map();
+
+  async function ensureStills(media) {
+    if (!hasLargeKeyframeGaps(media)) return { status: "off", count: 0 };
+    const key = media.id;
+    if (stillTasks.has(key)) return stillTasks.get(key).task;
+    const task = { status: "pending", count: 0, error: null, promise: null };
+    task.promise = (async () => {
+      try {
+        const directory = path.join(stillRoot, media.id);
+        const manifestPath = path.join(directory, "manifest.json");
+        const expected = media.analysis.keyframesUs.length;
+        try {
+          const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+          if (manifest.sourceSize === media.size && manifest.sourceMtimeMs === media.mtimeMs && manifest.count === expected) {
+            task.status = "ready";
+            task.count = manifest.count;
+            return task;
+          }
+        } catch {
+          // no manifest yet
+        }
+        await mkdir(directory, { recursive: true });
+        for (const name of await readdir(directory).catch(() => [])) {
+          if (/\.jpg$/i.test(name)) await unlink(path.join(directory, name)).catch(() => {});
+        }
+        logAdmin(`Extracting ${expected} keyframe stills for ${media.name}...`);
+        await runFfmpegToFile({
+          sourcePath: media.path,
+          outputPath: path.join(directory, "kf-%06d.jpg"),
+          ffmpegPath,
+          args: [
+            "-vf",
+            "select='eq(pict_type,I)'",
+            "-vsync",
+            "vfr",
+            "-q:v",
+            "4",
+            "-f",
+            "image2",
+          ],
+          onProgress: () => {},
+        });
+        const extracted = (await readdir(directory)).filter((name) => /\.jpg$/i.test(name)).sort();
+        if (extracted.length !== expected) {
+          throw new Error(`extracted ${extracted.length} stills but indexed ${expected} keyframes`);
+        }
+        await writeFile(
+          manifestPath,
+          JSON.stringify({ sourceSize: media.size, sourceMtimeMs: media.mtimeMs, count: extracted.length }),
+        );
+        task.status = "ready";
+        task.count = extracted.length;
+        logAdmin(`Extracted ${extracted.length} keyframe stills for ${media.name}`);
+      } catch (error) {
+        task.status = "failed";
+        task.error = error.message;
+        logAdmin(`Stills extraction failed for ${media.name}: ${error.message}`, "warn");
+      }
+      return task;
+    })();
+    stillTasks.set(key, { task });
+    task.promise.catch(() => {});
+    return task;
+  }
+
   async function registerMediaByPath(resolvedPath) {
     const filePath = await realpath(resolvedPath);
     const fileStat = await stat(filePath);
@@ -1111,6 +1184,7 @@ export async function createApp(options = {}) {
     if (preferences.previewScale !== "source") {
       ensureProxy(media, preferences.previewScale).catch(() => {});
     }
+    ensureStills(media).catch(() => {});
     return media;
   }
 
@@ -1682,6 +1756,50 @@ export async function createApp(options = {}) {
           return;
         }
         await streamFile(request, response, proxyFilePath(media.id, scale), "video/mp4");
+        return;
+      }
+
+      const stillsMatch = /^\/api\/media\/([a-f0-9]{24})\/stills$/.exec(url.pathname);
+      if (request.method === "GET" && stillsMatch) {
+        const media = mediaRegistry.get(stillsMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        const task = await ensureStills(media);
+        sendJson(response, 200, {
+          status: task.status,
+          count: task.count,
+          error: task.error ?? null,
+          baseUrl: `/api/media/${media.id}/still/`,
+        });
+        return;
+      }
+
+      const stillMatch = /^\/api\/media\/([a-f0-9]{24})\/still\/(\d+)$/.exec(url.pathname);
+      if (request.method === "GET" && stillMatch) {
+        const media = mediaRegistry.get(stillMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        const index = Number(stillMatch[2]);
+        const filePath = path.join(stillRoot, media.id, `kf-${String(index + 1).padStart(6, "0")}.jpg`);
+        try {
+          const fileStat = await stat(filePath);
+          if (!fileStat.isFile()) throw new Error("missing");
+        } catch {
+          sendJson(response, 404, { error: "Still not found" });
+          return;
+        }
+        const contents = await readFile(filePath);
+        response.writeHead(200, {
+          "Content-Type": "image/jpeg",
+          "Content-Length": contents.length,
+          "Cache-Control": "private, max-age=31536000",
+          "X-Content-Type-Options": "nosniff",
+        });
+        response.end(contents);
         return;
       }
 

@@ -96,6 +96,7 @@ const importSearchPathsInput = document.querySelector("#import-search-paths");
 const onlyFastEditsInput = document.querySelector("#only-fast-edits");
 const previewScaleSelect = document.querySelector("#preview-scale");
 const previewProgress = document.querySelector("#preview-progress");
+const stillElement = document.querySelector("#keyframe-still");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
@@ -112,6 +113,11 @@ let currentMedia = null;
 let keyframesUs = [];
 let sourceMetadataLine = "";
 let previewIsProxy = false;
+let stillsReady = false;
+let stillBaseUrl = null;
+let stillCount = 0;
+let stillMode = false;
+let pendingTargetUs = null;
 let markInUs = 0;
 let markOutUs = 0;
 let segments = [];
@@ -210,6 +216,7 @@ function timelineDurationUs() {
 }
 
 function currentEditTimeUs() {
+  if (stillMode && pendingTargetUs !== null) return pendingTargetUs;
   return editMode === "remove" ? sequencePlayheadUs : Math.round(video.currentTime * 1_000_000);
 }
 
@@ -487,6 +494,7 @@ function persistDraft() {
 
 function resetSequence(record = true) {
   if (!currentMedia) return;
+  clearStillMode();
   if (record) recordEdit();
   segments = editMode === "remove"
     ? [{ id: crypto.randomUUID(), inUs: 0, outUs: currentMedia.durationUs }]
@@ -578,6 +586,7 @@ function redoEdit() {
 }
 
 function setSequencePlayhead(timestampUs) {
+  clearStillMode();
   const mapped = sequenceToSource(timestampUs);
   if (!mapped) return;
   sequencePlayheadUs = mapped.sequenceUs;
@@ -588,16 +597,66 @@ function setSequencePlayhead(timestampUs) {
   drawTimeline();
 }
 
+function hideStill() {
+  stillElement.hidden = true;
+}
+
+function clearStillMode() {
+  stillMode = false;
+  pendingTargetUs = null;
+  hideStill();
+}
+
+function enterStillMode(sourceUs, sequenceUs) {
+  const index = keyframesUs.findIndex((keyframe) => Math.abs(keyframe - sourceUs) <= 80_000);
+  if (index < 0 || index >= stillCount) {
+    if (editMode === "remove") setSequencePlayhead(sequenceUs ?? sourceToSequence(sourceUs) ?? 0);
+    else video.currentTime = sourceUs / 1_000_000;
+    return;
+  }
+  stillMode = true;
+  pendingTargetUs = sourceUs;
+  if (editMode === "remove" && Number.isFinite(sequenceUs)) sequencePlayheadUs = sequenceUs;
+  stillElement.src = `${stillBaseUrl}${index}`;
+  stillElement.hidden = false;
+  const displayUs = currentEditTimeUs();
+  playheadTime.value = formatTimeUs(displayUs);
+  timeline.setAttribute("aria-valuenow", String(Math.round(displayUs)));
+  drawTimeline();
+}
+
+function exitStillMode(seekTo) {
+  const target = pendingTargetUs;
+  stillMode = false;
+  pendingTargetUs = null;
+  hideStill();
+  if (seekTo && Number.isFinite(target) && editMode === "include") {
+    video.currentTime = target / 1_000_000;
+  }
+}
+
+function seekToKeyframeOrSource(sourceUs, sequenceUs) {
+  if (stillsReady && video.paused) {
+    enterStillMode(sourceUs, sequenceUs);
+    return;
+  }
+  if (editMode === "remove") setSequencePlayhead(sequenceUs ?? sourceToSequence(sourceUs) ?? 0);
+  else video.currentTime = sourceUs / 1_000_000;
+}
+
 function seekBySeconds(seconds) {
   if (!currentMedia) return;
+  const baseUs = currentEditTimeUs();
   if (editMode === "remove") {
-    const targetUs = sequencePlayheadUs + seconds * 1_000_000;
+    const targetUs = baseUs + seconds * 1_000_000;
     const snappedUs = nearestInSorted(sequenceKeyframesUs(), targetUs);
-    setSequencePlayhead(snappedUs);
+    const mapped = sequenceToSource(snappedUs);
+    if (mapped) seekToKeyframeOrSource(mapped.sourceUs, snappedUs);
+    else setSequencePlayhead(snappedUs);
   } else {
-    const targetUs = (video.currentTime + seconds) * 1_000_000;
+    const targetUs = baseUs + seconds * 1_000_000;
     const snappedUs = nearestInSorted(keyframesUs, Math.max(0, Math.min(targetUs, (video.duration || 0) * 1_000_000)));
-    video.currentTime = snappedUs / 1_000_000;
+    seekToKeyframeOrSource(snappedUs);
   }
 }
 
@@ -615,13 +674,19 @@ function seekKeyframe(direction) {
   }
   const index = direction > 0 ? low : low - 1;
   if (index < 0 || index >= indexValues.length) return;
-  if (editMode === "remove") setSequencePlayhead(indexValues[index]);
-  else video.currentTime = indexValues[index] / 1_000_000;
+  const target = indexValues[index];
+  if (editMode === "remove") {
+    const mapped = sequenceToSource(target);
+    if (mapped) seekToKeyframeOrSource(mapped.sourceUs, target);
+  } else {
+    seekToKeyframeOrSource(target);
+  }
 }
 
 async function togglePlayback() {
   if (!currentMedia || (editMode === "remove" && segments.length === 0)) return;
   if (video.paused) {
+    if (stillMode) exitStillMode(true);
     if (editMode === "remove") setSequencePlayhead(sequencePlayheadUs >= sequenceDurationUs() ? 0 : sequencePlayheadUs);
     await video.play();
   } else video.pause();
@@ -659,11 +724,20 @@ function seekTimeline(clientX) {
   const bounds = timeline.getBoundingClientRect();
   const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
   const targetUs = ratio * timelineDurationUs();
-  const snappedUs = previewIsProxy
-    ? targetUs
-    : nearestInSorted(editMode === "remove" ? sequenceKeyframesUs() : keyframesUs, targetUs);
-  if (editMode === "remove") setSequencePlayhead(snappedUs);
-  else video.currentTime = snappedUs / 1_000_000;
+  if (previewIsProxy) {
+    if (stillMode) exitStillMode(false);
+    if (editMode === "remove") setSequencePlayhead(targetUs);
+    else video.currentTime = targetUs / 1_000_000;
+    return;
+  }
+  const snappedUs = nearestInSorted(editMode === "remove" ? sequenceKeyframesUs() : keyframesUs, targetUs);
+  if (editMode === "remove") {
+    const mapped = sequenceToSource(snappedUs);
+    if (mapped) seekToKeyframeOrSource(mapped.sourceUs, snappedUs);
+    else setSequencePlayhead(snappedUs);
+  } else {
+    seekToKeyframeOrSource(snappedUs);
+  }
 }
 
 function updateExportControls() {
@@ -788,7 +862,44 @@ async function configurePreview(media) {
   }
 }
 
+async function configureStills(media) {
+  clearStillMode();
+  stillsReady = false;
+  stillBaseUrl = null;
+  stillCount = 0;
+  if (!media) return;
+  try {
+    const result = await request(`/api/media/${media.id}/stills`);
+    if (result.status === "ready") {
+      stillsReady = true;
+      stillBaseUrl = result.baseUrl;
+      stillCount = result.count;
+      return;
+    }
+    if (result.status === "pending") {
+      for (let attempt = 0; attempt < 90; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        try {
+          const updated = await request(`/api/media/${media.id}/stills`);
+          if (updated.status === "ready") {
+            stillsReady = true;
+            stillBaseUrl = updated.baseUrl;
+            stillCount = updated.count;
+            return;
+          }
+          if (updated.status === "failed" || updated.status === "off") return;
+        } catch {
+          return;
+        }
+      }
+    }
+  } catch {
+    // Stills are an optional enhancement.
+  }
+}
+
 function adoptMedia(media, keyframes) {
+  clearStillMode();
   currentMedia = media;
   keyframesUs = keyframes;
   editMode = preferences.defaultEditMode;
@@ -826,6 +937,7 @@ async function loadMedia(locator, button) {
     const keyframeIndex = await request(media.keyframesUrl);
     adoptMedia(media, keyframeIndex.keyframesUs);
     configurePreview(media);
+    configureStills(media);
     return true;
   } catch (error) {
     notice.textContent = error.message;
@@ -847,6 +959,7 @@ async function loadLocatedMedia(name, button) {
     const keyframeIndex = await request(media.keyframesUrl);
     adoptMedia(media, keyframeIndex.keyframesUs);
     configurePreview(media);
+    configureStills(media);
     return true;
   } catch (error) {
     notice.textContent = error.message;
@@ -871,6 +984,7 @@ async function loadDroppedFile(file) {
     });
     const keyframeIndex = await request(media.keyframesUrl);
     adoptMedia(media, keyframeIndex.keyframesUs);
+    configureStills(media);
     await refreshLibrary();
     notice.textContent = `Opened "${file.name}" from disk. Nothing was copied.`;
   } catch (error) {
@@ -1714,6 +1828,7 @@ video.addEventListener("seeked", () => {
   syncRemovePlayback();
 });
 video.addEventListener("play", () => {
+  if (stillMode) exitStillMode(true);
   if (editMode === "remove") setSequencePlayhead(sequencePlayheadUs);
 });
 video.addEventListener("error", () => {
