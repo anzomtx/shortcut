@@ -37,7 +37,10 @@
             <span>MP4</span>
             <p>Your source remains on disk. Playback is streamed in byte ranges.</p>
           </div>
-          <label class="preview-scale-control" for="preview-scale">
+        </div>
+
+        <div class="preview-controls" id="preview-controls">
+          <label class="preview-scale-select" for="preview-scale">
             <span>Preview</span>
             <select id="preview-scale" aria-label="Preview resolution">
               <option value="source">Full</option>
@@ -45,6 +48,7 @@
               <option value="quarter">Quarter</option>
             </select>
           </label>
+          <output class="preview-progress" id="preview-progress" role="status" aria-live="polite"></output>
         </div>
 
         <div class="recovery-bar" id="recovery-bar" hidden>
@@ -241,6 +245,7 @@
         <div class="preferences-message" id="preferences-message" role="status"></div>
         <div class="preferences-actions">
           <button type="button" id="reset-shortcuts">Reset defaults</button>
+          <button type="button" id="clear-proxies">Clear preview proxies</button>
         </div>
       </form>
     </dialog>

@@ -62,7 +62,7 @@ Client errors, server crashes, and supervisor restarts are recorded as JSON Line
 
 Files with long keyframe intervals (large GOP) seek slowly in the browser because each seek decodes from the nearest keyframe. Two options address this:
 
-- **Preview resolution** (Preferences): choose Full, Half, or Quarter resolution. Half/Quarter generate a cached preview proxy (dense ~1s keyframes, fast-start moov) in the background and the browser previews it, with the current progress shown in the status line. Edits and exports always use the source timestamps, so output quality is unaffected. Proxies are cached per source and regenerate only when the source changes.
+- **Preview resolution** (control below the video): choose Full, Half, or Quarter resolution. Half/Quarter generate a cached preview proxy (dense ~1s keyframes, fast-start moov, half frame rate) in the background and the browser previews it, with generation progress shown as a percentage next to the control. Edits and exports always use the source timestamps, so output quality is unaffected. Proxies are cached per source, regenerate only when the source changes, and can be cleared from Preferences (**Clear preview proxies**).
 - **Keyframe-snapped scrubbing**: when previewing the full-resolution source, dragging/clicking the timeline lands on the nearest source keyframe (like Avidemux coarse scrub) so the browser decodes at most a partial GOP per stop. With a proxy active, scrubbing is precise.
 
 Open <http://127.0.0.1:4173> and click an MP4 filename in the local library, or drop an MP4 anywhere onto the video area — dropped files are located by name on disk and streamed in place, never copied. Files must contain an H.264 video stream.

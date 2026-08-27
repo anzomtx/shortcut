@@ -95,9 +95,11 @@ const exportNameExample = document.querySelector("#export-name-example");
 const importSearchPathsInput = document.querySelector("#import-search-paths");
 const onlyFastEditsInput = document.querySelector("#only-fast-edits");
 const previewScaleSelect = document.querySelector("#preview-scale");
+const previewProgress = document.querySelector("#preview-progress");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
+const clearProxiesButton = document.querySelector("#clear-proxies");
 const recoveryBar = document.querySelector("#recovery-bar");
 const recoveryMessage = document.querySelector("#recovery-message");
 const recoveryRestoreButton = document.querySelector("#recovery-restore");
@@ -708,6 +710,7 @@ function reportClientError(level, message, context) {
 
 function applyPreviewSource(proxy) {
   previewIsProxy = true;
+  previewProgress.textContent = "";
   const keepTime = video.currentTime;
   video.src = proxy.streamUrl;
   if (Number.isFinite(keepTime) && keepTime > 0) {
@@ -735,11 +738,14 @@ async function waitForProxy(media) {
       return;
     }
     if (proxy.status === "failed") {
+      previewProgress.textContent = "";
       notice.textContent = `Preview proxy failed: ${proxy.error ?? "unknown"}`;
       return;
     }
     if (proxy.status === "pending" && Number.isFinite(proxy.progress)) {
-      notice.textContent = `Generating ${proxy.scale === "half" ? "half" : "quarter"}-res preview... ${Math.round(proxy.progress)}%`;
+      const percent = Math.round(proxy.progress);
+      previewProgress.textContent = `Generating ${proxy.scale === "half" ? "half" : "quarter"}-res preview... ${percent}%`;
+      notice.textContent = `Generating ${proxy.scale === "half" ? "half" : "quarter"}-res preview... ${percent}%`;
     }
   }
 }
@@ -748,6 +754,7 @@ async function configurePreview(media) {
   const scale = preferences.previewScale;
   if (!scale || scale === "source") {
     previewIsProxy = false;
+    previewProgress.textContent = "";
     video.src = media.streamUrl;
     video.load();
     metadata.textContent = sourceMetadataLine;
@@ -761,12 +768,20 @@ async function configurePreview(media) {
       return;
     }
     if (proxy.status === "pending") {
-      notice.textContent = "Generating preview proxy...";
+      const percent = Number.isFinite(proxy.progress) ? Math.round(proxy.progress) : null;
+      const label = proxy.scale === "half" ? "half" : "quarter";
+      previewProgress.textContent = percent !== null
+        ? `Generating ${label}-res preview... ${percent}%`
+        : `Generating ${label}-res preview...`;
+      notice.textContent = previewProgress.textContent;
       await waitForProxy(media);
       return;
     }
+    previewProgress.textContent = "";
     notice.textContent = `Preview proxy unavailable: ${proxy.error ?? "unknown"}`;
   } catch {
+    previewIsProxy = false;
+    previewProgress.textContent = "";
     video.src = media.streamUrl;
     video.load();
     metadata.textContent = sourceMetadataLine;
@@ -1585,6 +1600,23 @@ resetShortcutsButton.addEventListener("click", () => {
   preferencesDraft.shortcuts = structuredClone(DEFAULT_PREFERENCES.shortcuts);
   preferencesMessage.textContent = "Default shortcuts restored. Press Enter or close Preferences to apply them.";
   renderShortcutEditor();
+});
+clearProxiesButton.addEventListener("click", async () => {
+  if (!window.confirm("Delete all cached preview proxies? They regenerate on demand.")) return;
+  try {
+    const result = await request("/api/proxies", { method: "DELETE" });
+    preferences.previewScale = "source";
+    previewScaleSelect.value = "source";
+    if (currentMedia) {
+      previewIsProxy = false;
+      video.src = currentMedia.streamUrl;
+      video.load();
+      metadata.textContent = sourceMetadataLine;
+    }
+    preferencesMessage.textContent = `Cleared ${result.removed} preview proxy file${result.removed === 1 ? "" : "s"}. Preview set to full resolution.`;
+  } catch (error) {
+    preferencesMessage.textContent = error.message;
+  }
 });
 preferencesForm.addEventListener("submit", (event) => {
   event.preventDefault();

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, open as openFile, appendFile, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, open as openFile, appendFile, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1006,16 +1006,18 @@ export async function createApp(options = {}) {
         }
         await mkdir(proxyDirectory, { recursive: true });
         const dims = proxyDimensions(media, scale);
-        const gop = Math.max(1, Math.round(media.analysis.video.averageFrameRate ?? 30));
+        const sourceFps = media.analysis.video.averageFrameRate ?? 30;
+        const previewFps = Math.max(1, Math.round(sourceFps / 2));
+        const gop = Math.max(1, Math.round(previewFps));
         const tempPath = `${proxyFilePath(media.id, scale)}.${process.pid}.tmp`;
-        logAdmin(`Generating ${scale}-res proxy for ${media.name}...`);
+        logAdmin(`Generating ${scale}-res proxy for ${media.name} (${previewFps} fps)...`);
         const progressSeconds = await runFfmpegToFile({
           sourcePath: media.path,
           outputPath: tempPath,
           ffmpegPath,
           args: [
             "-vf",
-            `scale=${dims.width}:${dims.height}`,
+            `scale=${dims.width}:${dims.height},fps=${previewFps}`,
             "-c:v",
             "libx264",
             "-preset",
@@ -1051,6 +1053,7 @@ export async function createApp(options = {}) {
             scale,
             width: dims.width,
             height: dims.height,
+            fps: previewFps,
             gop,
           }),
         );
@@ -1338,6 +1341,24 @@ export async function createApp(options = {}) {
         }
         logAdmin("Preferences saved");
         sendJson(response, 200, preferences);
+        return;
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/proxies") {
+        let removed = 0;
+        const entries = await readdir(proxyDirectory).catch(() => []);
+        for (const name of entries) {
+          if (!/\.(mp4|json)$/i.test(name)) continue;
+          try {
+            await unlink(path.join(proxyDirectory, name));
+            removed += 1;
+          } catch {
+            // already gone
+          }
+        }
+        proxyTasks.clear();
+        logAdmin(`Cleared ${removed} preview proxy file${removed === 1 ? "" : "s"}`);
+        sendJson(response, 200, { removed });
         return;
       }
 
