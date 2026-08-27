@@ -691,3 +691,31 @@ test("extracts and serves keyframe stills for long-GOP files", async () => {
   const missingResponse = await fetch(`${baseUrl}/api/media/${media.id}/still/9999`);
   assert.equal(missingResponse.status, 404);
 });
+
+test("preview generation can be disabled and background FFmpeg stopped", async () => {
+  const media = await registerSample();
+  const prefs = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  const updateResponse = await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewScale: "quarter", previewGeneration: false }),
+  });
+  assert.equal(updateResponse.status, 200);
+  assert.equal((await updateResponse.json()).previewGeneration, false);
+
+  const proxyStatus = await (await fetch(`${baseUrl}/api/media/${media.id}/proxy`)).json();
+  assert.equal(proxyStatus.status, "off");
+  const stillsStatus = await (await fetch(`${baseUrl}/api/media/${media.id}/stills`)).json();
+  assert.equal(stillsStatus.status, "off");
+
+  const stopBackgroundResponse = await fetch(`${baseUrl}/api/admin/stop-background`, { method: "POST" });
+  assert.equal(stopBackgroundResponse.status, 200);
+  const stopResult = await stopBackgroundResponse.json();
+  assert.equal(typeof stopResult.stopped, "number");
+
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewGeneration: true }),
+  });
+});

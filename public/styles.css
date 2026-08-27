@@ -319,6 +319,22 @@ main.sidebar-collapsed {
   color: #d1fe3f;
 }
 
+.still-indicator {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.08rem 0.4rem;
+  border: 1px solid #d1fe3f;
+  border-radius: 0.35rem;
+  color: #d1fe3f;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.still-indicator[hidden] {
+  display: none;
+}
+
 .transport {
   display: grid;
   grid-template-columns: 1fr auto 1fr;

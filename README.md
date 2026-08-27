@@ -64,7 +64,9 @@ Files with long keyframe intervals (large GOP) seek slowly in the browser becaus
 
 - **Preview resolution** (control below the video): choose Full, Half, or Quarter resolution. Half/Quarter generate a cached preview proxy (dense ~1s keyframes, fast-start moov, half frame rate) in the background and the browser previews it, with generation progress shown as a percentage next to the control. Edits and exports always use the source timestamps, so output quality is unaffected. Proxies are cached per source, regenerate only when the source changes, and can be cleared from Preferences (**Clear preview proxies**).
 - **Keyframe-snapped scrubbing**: when previewing the full-resolution source, dragging/clicking the timeline lands on the nearest source keyframe (like Avidemux coarse scrub) so the browser decodes at most a partial GOP per stop. With a proxy active, scrubbing is precise.
-- **Keyframe stills**: for long-GOP files, the server extracts a JPEG at each keyframe in the background. Jumping to a keyframe then shows the still instantly (no decode), and playback swaps to the live video — so navigating a 12s-GOP file is immediate.
+- **Keyframe stills**: for long-GOP files, the server extracts a JPEG at each keyframe in the background. Jumping to a keyframe then shows the still instantly (no decode — the video element is not asked for frames), a **STILL** indicator appears next to the preview controls, and playback swaps to the live video.
+- **Preview generation toggle** (Preferences): disables the background FFmpeg work for proxies and stills; the source is used directly.
+- The admin console can **Stop background** to kill any running proxy/stills FFmpeg processes.
 
 Open <http://127.0.0.1:4173> and click an MP4 filename in the local library, or drop an MP4 anywhere onto the video area — dropped files are located by name on disk and streamed in place, never copied. Files must contain an H.264 video stream.
 

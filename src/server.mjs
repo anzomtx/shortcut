@@ -24,6 +24,7 @@ const DEFAULT_PREFERENCES = {
   importSearchPaths: [],
   onlyFastEdits: false,
   previewScale: "source",
+  previewGeneration: true,
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -126,13 +127,14 @@ async function scanMp4Files(root, directory = root) {
   return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
-function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress }) {
+function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, children }) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       ffmpegPath,
       ["-v", "error", "-y", "-i", sourcePath, ...args, outputPath],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
+    children?.add(child);
     const stderr = [];
     let progress = 0;
     child.stderr.on("data", (chunk) => stderr.push(chunk));
@@ -147,8 +149,12 @@ function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress 
         }
       }
     });
-    child.on("error", (error) => reject(new Error(`Unable to run ffmpeg: ${error.message}`)));
+    child.on("error", (error) => {
+      children?.delete(child);
+      reject(new Error(`Unable to run ffmpeg: ${error.message}`));
+    });
     child.on("close", (code) => {
+      children?.delete(child);
       if (code !== 0) {
         reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || "ffmpeg failed"));
         return;
@@ -635,6 +641,7 @@ function validatePreferences(body) {
     importSearchPaths,
     onlyFastEdits: body.onlyFastEdits === true,
     previewScale: body.previewScale === "half" || body.previewScale === "quarter" ? body.previewScale : "source",
+    previewGeneration: body.previewGeneration !== false,
     shortcuts,
   };
 }
@@ -952,6 +959,7 @@ export async function createApp(options = {}) {
     return exportWrite;
   }
 
+  const backgroundChildren = new Set();
   const proxyTasks = new Map();
 
   function proxyDimensions(media, scale) {
@@ -995,6 +1003,7 @@ export async function createApp(options = {}) {
   }
 
   async function ensureProxy(media, scale) {
+    if (!preferences.previewGeneration) return { status: "off", progress: 0, error: null, dims: null };
     const key = `${media.id}:${scale}`;
     if (proxyTasks.has(key)) return proxyTasks.get(key).task;
     const task = { status: "pending", progress: 0, error: null, dims: null, promise: null };
@@ -1045,6 +1054,7 @@ export async function createApp(options = {}) {
             const duration = media.analysis.durationUs / 1_000_000;
             task.progress = duration > 0 ? Math.min(0.99, seconds / duration) : 0;
           },
+          children: backgroundChildren,
         });
         await rename(tempPath, proxyFilePath(media.id, scale));
         await writeFile(
@@ -1083,6 +1093,7 @@ export async function createApp(options = {}) {
   const stillTasks = new Map();
 
   async function ensureStills(media) {
+    if (!preferences.previewGeneration) return { status: "off", count: 0 };
     if (!hasLargeKeyframeGaps(media)) return { status: "off", count: 0 };
     const key = media.id;
     if (stillTasks.has(key)) return stillTasks.get(key).task;
@@ -1122,6 +1133,7 @@ export async function createApp(options = {}) {
             "image2",
           ],
           onProgress: () => {},
+          children: backgroundChildren,
         });
         const extracted = (await readdir(directory)).filter((name) => /\.jpg$/i.test(name)).sort();
         if (extracted.length !== expected) {
@@ -1181,10 +1193,12 @@ export async function createApp(options = {}) {
     };
     mediaRegistry.set(id, media);
     logAdmin(`Registered ${media.name} (${keyframeLabel(analysis)})`);
-    if (preferences.previewScale !== "source") {
-      ensureProxy(media, preferences.previewScale).catch(() => {});
+    if (preferences.previewGeneration) {
+      if (preferences.previewScale !== "source") {
+        ensureProxy(media, preferences.previewScale).catch(() => {});
+      }
+      ensureStills(media).catch(() => {});
     }
-    ensureStills(media).catch(() => {});
     return media;
   }
 
@@ -1318,6 +1332,33 @@ export async function createApp(options = {}) {
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/api/admin/stop-background") {
+        let stopped = 0;
+        for (const child of backgroundChildren) {
+          try {
+            child.kill("SIGKILL");
+            stopped += 1;
+          } catch {
+            // already gone
+          }
+        }
+        for (const { task } of proxyTasks.values()) {
+          if (task.status === "pending") {
+            task.status = "failed";
+            task.error = "Stopped from the admin console";
+          }
+        }
+        for (const { task } of stillTasks.values()) {
+          if (task.status === "pending") {
+            task.status = "failed";
+            task.error = "Stopped from the admin console";
+          }
+        }
+        logAdmin(stopped > 0 ? `Stopped ${stopped} background FFmpeg process${stopped === 1 ? "" : "es"}` : "No background FFmpeg processes were running", "warn");
+        sendJson(response, 200, { stopped });
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/api/admin/restart") {
         logAdmin("Resetting server state...", "warn");
         exportQueue.clear();
@@ -1408,9 +1449,14 @@ export async function createApp(options = {}) {
           exportPath: outputRoot,
         };
         await persistPreferences();
-        if (preferences.previewScale !== "source") {
+        if (preferences.previewGeneration) {
+          if (preferences.previewScale !== "source") {
+            for (const media of mediaRegistry.values()) {
+              ensureProxy(media, preferences.previewScale).catch(() => {});
+            }
+          }
           for (const media of mediaRegistry.values()) {
-            ensureProxy(media, preferences.previewScale).catch(() => {});
+            ensureStills(media).catch(() => {});
           }
         }
         logAdmin("Preferences saved");

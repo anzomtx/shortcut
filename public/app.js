@@ -16,6 +16,7 @@ const DEFAULT_PREFERENCES = {
   importSearchPaths: [],
   onlyFastEdits: false,
   previewScale: "source",
+  previewGeneration: true,
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -96,7 +97,11 @@ const importSearchPathsInput = document.querySelector("#import-search-paths");
 const onlyFastEditsInput = document.querySelector("#only-fast-edits");
 const previewScaleSelect = document.querySelector("#preview-scale");
 const previewProgress = document.querySelector("#preview-progress");
+const previewGenerationInput = document.querySelector("#preview-generation");
+const previewControls = document.querySelector("#preview-controls");
+const stillIndicator = document.querySelector("#still-indicator");
 const stillElement = document.querySelector("#keyframe-still");
+const adminStopBackgroundButton = document.querySelector("#admin-stop-background");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
@@ -601,10 +606,15 @@ function hideStill() {
   stillElement.hidden = true;
 }
 
+function updateStillIndicator() {
+  stillIndicator.hidden = !stillMode;
+}
+
 function clearStillMode() {
   stillMode = false;
   pendingTargetUs = null;
   hideStill();
+  updateStillIndicator();
 }
 
 function enterStillMode(sourceUs, sequenceUs) {
@@ -619,6 +629,7 @@ function enterStillMode(sourceUs, sequenceUs) {
   if (editMode === "remove" && Number.isFinite(sequenceUs)) sequencePlayheadUs = sequenceUs;
   stillElement.src = `${stillBaseUrl}${index}`;
   stillElement.hidden = false;
+  updateStillIndicator();
   const displayUs = currentEditTimeUs();
   playheadTime.value = formatTimeUs(displayUs);
   timeline.setAttribute("aria-valuenow", String(Math.round(displayUs)));
@@ -630,6 +641,7 @@ function exitStillMode(seekTo) {
   stillMode = false;
   pendingTargetUs = null;
   hideStill();
+  updateStillIndicator();
   if (seekTo && Number.isFinite(target) && editMode === "include") {
     video.currentTime = target / 1_000_000;
   }
@@ -825,6 +837,17 @@ async function waitForProxy(media) {
 }
 
 async function configurePreview(media) {
+  const generationEnabled = preferences.previewGeneration !== false;
+  previewControls.hidden = !generationEnabled;
+  if (!generationEnabled) {
+    previewIsProxy = false;
+    previewProgress.textContent = "";
+    stillIndicator.hidden = true;
+    video.src = media.streamUrl;
+    video.load();
+    metadata.textContent = sourceMetadataLine;
+    return;
+  }
   const scale = preferences.previewScale;
   if (!scale || scale === "source") {
     previewIsProxy = false;
@@ -868,6 +891,7 @@ async function configureStills(media) {
   stillBaseUrl = null;
   stillCount = 0;
   if (!media) return;
+  if (preferences.previewGeneration === false) return;
   try {
     const result = await request(`/api/media/${media.id}/stills`);
     if (result.status === "ready") {
@@ -1472,6 +1496,19 @@ async function shutdownServer() {
 adminStopButton.addEventListener("click", forceStopServerWork);
 adminRestartButton.addEventListener("click", resetServerState);
 adminShutdownButton.addEventListener("click", shutdownServer);
+
+async function stopBackgroundWork() {
+  try {
+    const result = await request("/api/admin/stop-background", { method: "POST" });
+    notice.textContent = result.stopped > 0
+      ? `Stopped ${result.stopped} background FFmpeg process${result.stopped === 1 ? "" : "es"}.`
+      : "No background FFmpeg processes were running.";
+    await refreshAdminLog();
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+adminStopBackgroundButton.addEventListener("click", stopBackgroundWork);
 openAdminButton.addEventListener("click", openAdminConsole);
 
 function activatePanelTab(name) {
@@ -1601,6 +1638,7 @@ function openPreferences() {
   importSearchPathsInput.value = (preferencesDraft.importSearchPaths ?? []).join("\n");
   onlyFastEditsInput.checked = Boolean(preferencesDraft.onlyFastEdits);
   previewScaleSelect.value = preferencesDraft.previewScale ?? "source";
+  previewGenerationInput.checked = preferencesDraft.previewGeneration !== false;
   updateExportNameExample();
   capturingActionId = null;
   preferencesMessage.textContent = "";
@@ -1621,11 +1659,15 @@ async function savePreferences() {
     .filter(Boolean);
   preferencesDraft.onlyFastEdits = onlyFastEditsInput.checked;
   preferencesDraft.previewScale = previewScaleSelect.value || "source";
+  preferencesDraft.previewGeneration = previewGenerationInput.checked;
   try {
     await persistPreferences(preferencesDraft);
     await refreshLibrary();
     updateExportControls();
-    if (currentMedia) configurePreview(currentMedia);
+    if (currentMedia) {
+      configurePreview(currentMedia);
+      configureStills(currentMedia);
+    }
     notice.textContent = "Preferences saved and paths reloaded.";
     return true;
   } catch (error) {
@@ -1756,6 +1798,10 @@ document.addEventListener("pointerdown", (event) => {
 });
 exportNameTemplateInput.addEventListener("input", updateExportNameExample);
 previewScaleSelect.addEventListener("change", async () => {
+  if (preferences.previewGeneration === false) {
+    previewScaleSelect.value = "source";
+    return;
+  }
   preferences.previewScale = previewScaleSelect.value;
   try {
     await persistPreferences({ ...preferences });
