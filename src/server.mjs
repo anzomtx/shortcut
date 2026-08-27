@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, open as openFile, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, open as openFile, appendFile, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,6 +10,7 @@ import { ExportQueue } from "./export-queue.mjs";
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_ROOT = path.resolve(SOURCE_DIRECTORY, "../public");
+const LOG_DIRECTORY = path.resolve(SOURCE_DIRECTORY, "../logs");
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024;
 const EXPORT_NAME_DEFAULT = "%o-%m-%h.%ext";
@@ -67,6 +68,15 @@ function sendJson(response, statusCode, value) {
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function appendLogLine(fileName, entry) {
+  try {
+    await mkdir(LOG_DIRECTORY, { recursive: true });
+    await appendFile(path.join(LOG_DIRECTORY, fileName), `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (error) {
+    console.error("Unable to write log file", error);
+  }
 }
 
 async function readJson(request) {
@@ -1098,6 +1108,22 @@ export async function createApp(options = {}) {
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/api/log") {
+        const body = await readJson(request);
+        const level = body.level === "error" || body.level === "warn" ? body.level : "info";
+        const message = String(body.message ?? "").slice(0, 2000);
+        await appendLogLine("client-errors.jsonl", {
+          at: new Date().toISOString(),
+          level,
+          message,
+          stack: String(body.stack ?? "").slice(0, 8000),
+          context: body.context ?? null,
+        });
+        if (message) logAdmin(`Client ${level}: ${message.slice(0, 160)}`, level === "error" ? "error" : "warn");
+        sendJson(response, 200, { ok: true });
+        return;
+      }
+
       if (request.method === "DELETE" && url.pathname === "/api/exports") {
         exportQueue.clear();
         await exportWrite;
@@ -1456,6 +1482,24 @@ async function main() {
   const port = Number(process.env.PORT ?? 4173);
   const host = "127.0.0.1";
   await verifyRuntime();
+  process.on("uncaughtException", (error) => {
+    console.error(error);
+    appendLogLine("server-errors.jsonl", {
+      at: new Date().toISOString(),
+      level: "error",
+      message: error?.message ?? String(error),
+      stack: error?.stack ?? null,
+    }).finally(() => process.exit(1));
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error(reason);
+    appendLogLine("server-errors.jsonl", {
+      at: new Date().toISOString(),
+      level: "error",
+      message: String(reason?.message ?? reason),
+      stack: reason?.stack ?? null,
+    }).finally(() => process.exit(1));
+  });
   const server = await createApp();
   server.listen(port, host, () => {
     console.log(`Shortcut is running at http://${host}:${port}`);

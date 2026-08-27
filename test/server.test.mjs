@@ -571,3 +571,37 @@ test("exposes an admin log with stop and reset controls", async () => {
   const projectsAfter = await (await fetch(`${baseUrl}/api/projects`)).json();
   assert.ok(Array.isArray(projectsAfter.projects));
 });
+
+test("logs client errors to the /logs folder", async () => {
+  const logResponse = await fetch(`${baseUrl}/api/log`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      level: "error",
+      message: "test client crash",
+      stack: "Error: test client crash\n    at fakeCall",
+      context: { media: "sample.mp4" },
+    }),
+  });
+  assert.equal(logResponse.status, 200);
+  assert.deepEqual(await logResponse.json(), { ok: true });
+
+  const logPath = path.join(path.dirname(new URL(import.meta.url).pathname), "../logs", "client-errors.jsonl");
+  const logContent = await readFile(logPath, "utf8");
+  const lastLine = logContent.trim().split("\n").pop();
+  const entry = JSON.parse(lastLine);
+  assert.equal(entry.level, "error");
+  assert.equal(entry.message, "test client crash");
+  assert.match(entry.stack, /fakeCall/);
+  assert.equal(entry.context.media, "sample.mp4");
+
+  const badLevelResponse = await fetch(`${baseUrl}/api/log`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "no level" }),
+  });
+  assert.equal(badLevelResponse.status, 200);
+  const logContent2 = await readFile(logPath, "utf8");
+  const lastEntry = JSON.parse(logContent2.trim().split("\n").pop());
+  assert.equal(lastEntry.level, "info");
+});

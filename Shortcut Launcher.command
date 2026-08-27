@@ -16,4 +16,6 @@ echo "Press Ctrl+C in this window to stop the server."
 # Give the server a moment to boot, then open the browser.
 ( sleep 1 && open "http://127.0.0.1:4173" ) &
 
-exec npm start
+# Run under the supervisor so a crashed server restarts automatically.
+# The supervisor exits when the server stops cleanly (e.g. the Shut down button).
+exec node scripts/supervise.mjs

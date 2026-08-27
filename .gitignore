@@ -3,5 +3,6 @@
 .shortcut-data/
 node_modules/
 coverage/
+logs/
 media/*
 !media/.gitkeep

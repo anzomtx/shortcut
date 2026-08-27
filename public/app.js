@@ -96,6 +96,13 @@ const onlyFastEditsInput = document.querySelector("#only-fast-edits");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
+const recoveryBar = document.querySelector("#recovery-bar");
+const recoveryMessage = document.querySelector("#recovery-message");
+const recoveryRestoreButton = document.querySelector("#recovery-restore");
+const recoveryDismissButton = document.querySelector("#recovery-dismiss");
+
+const DRAFT_KEY = "shortcut.draft.v1";
+const CLEAN_CLOSE_KEY = "shortcut.clean-close";
 
 let currentMedia = null;
 let keyframesUs = [];
@@ -333,6 +340,7 @@ function renderMarks() {
   applyRangeButton.disabled = !currentMedia || markOutUs <= markInUs;
   drawTimeline();
   updateControlStates();
+  persistDraft();
 }
 
 function renderSegments() {
@@ -389,6 +397,7 @@ function renderSegments() {
   drawTimeline();
   updateExportControls();
   updateControlStates();
+  persistDraft();
 }
 
 function snapshotEdit() {
@@ -422,6 +431,52 @@ function resetHistory() {
   undoStack = [];
   redoStack = [];
   updateControlStates();
+}
+
+function readDraft() {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDraft(draft) {
+  try {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+  } catch {
+    // Storage full or unavailable — the draft is best effort.
+  }
+}
+
+function clearDraft() {
+  try {
+    localStorage.removeItem(DRAFT_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function persistDraft() {
+  if (!currentMedia) return;
+  writeDraft({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    media: {
+      name: currentMedia.name,
+      relativePath: currentMedia.relativePath,
+      absolutePath: currentMedia.absolutePath,
+    },
+    projectId: currentProjectId,
+    projectName: projectName.value || null,
+    editMode,
+    segments: segments.map(({ id, inUs, outUs }) => ({ id, inUs, outUs })),
+    markInUs,
+    markOutUs,
+    sequencePlayheadUs,
+    selectedSegmentId,
+  });
 }
 
 function resetSequence(record = true) {
@@ -630,6 +685,18 @@ async function request(url, options) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error ?? "Request failed");
   return data;
+}
+
+function reportClientError(level, message, context) {
+  try {
+    fetch("/api/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ level, message: String(message).slice(0, 2000), context }),
+    }).catch(() => {});
+  } catch {
+    // Logging is best effort.
+  }
 }
 
 function adoptMedia(media, keyframes) {
@@ -1541,6 +1608,77 @@ viewerShell.addEventListener("drop", (event) => {
 });
 new ResizeObserver(drawTimeline).observe(timeline);
 
+function restoreDraftToState(draft) {
+  currentProjectId = draft.projectId ?? null;
+  editMode = draft.editMode ?? "remove";
+  includeModeButton.classList.toggle("active", editMode === "include");
+  removeModeButton.classList.toggle("active", editMode === "remove");
+  applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
+  segments = (draft.segments ?? []).map((segment) => ({ ...segment }));
+  selectedSegmentId = draft.selectedSegmentId ?? segments[0]?.id ?? null;
+  sequencePlayheadUs = draft.sequencePlayheadUs ?? 0;
+  markInUs = draft.markInUs ?? 0;
+  markOutUs = draft.markOutUs ?? timelineDurationUs();
+  if (draft.projectName) projectName.value = draft.projectName;
+  resetHistory();
+  renderMarks();
+  renderSegments();
+  if (editMode === "remove" && segments.length > 0) setSequencePlayhead(sequencePlayheadUs);
+}
+
+async function restoreDraft(draft) {
+  if (!draft?.media) return false;
+  const media = draft.media;
+  const loaded = media.relativePath
+    ? await loadMedia({ relativePath: media.relativePath }, null)
+    : await loadLocatedMedia(media.name, null);
+  if (!loaded) {
+    notice.textContent = `Could not restore ${media.name} — the file may have moved. Draft kept for manual restore.`;
+    return false;
+  }
+  restoreDraftToState(draft);
+  return true;
+}
+
+function showRecoveryBar(draft) {
+  recoveryMessage.textContent = `Unsaved edit session for ${draft.media?.name ?? "a file"} (${(draft.segments ?? []).length} segment${(draft.segments ?? []).length === 1 ? "" : "s"}).`;
+  recoveryBar.hidden = false;
+}
+
+function hideRecoveryBar() {
+  recoveryBar.hidden = true;
+}
+
+recoveryRestoreButton.addEventListener("click", async () => {
+  const draft = readDraft();
+  hideRecoveryBar();
+  if (draft) {
+    notice.textContent = "Restoring last edit session...";
+    await restoreDraft(draft);
+  }
+});
+
+recoveryDismissButton.addEventListener("click", () => {
+  hideRecoveryBar();
+  clearDraft();
+  reportClientError("info", "User dismissed the recovered draft.", { at: new Date().toISOString() });
+});
+
+window.addEventListener("pagehide", () => {
+  try {
+    localStorage.setItem(CLEAN_CLOSE_KEY, "1");
+  } catch {
+    // ignore
+  }
+});
+window.addEventListener("error", (event) => {
+  reportClientError("error", event.message ?? "Uncaught error", { source: "window.error", stack: event.error?.stack ?? null });
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportClientError("error", String(reason?.message ?? reason), { source: "unhandledrejection", stack: reason?.stack ?? null });
+});
+
 async function initialize() {
   try {
     const savedPreferences = await request("/api/preferences");
@@ -1561,6 +1699,32 @@ async function initialize() {
   updateControlStates();
   await Promise.all([refreshLibrary(), refreshProjects(), refreshExportQueue()]);
   window.setInterval(refreshExportQueue, 750);
+
+  const draft = readDraft();
+  if (draft && draft.version === 1) {
+    const cleanClose = (() => {
+      try {
+        return localStorage.getItem(CLEAN_CLOSE_KEY) === "1";
+      } catch {
+        return false;
+      }
+    })();
+    if (cleanClose) {
+      showRecoveryBar(draft);
+    } else {
+      reportClientError("warn", "Previous session did not close cleanly; restoring draft.", {
+        media: draft.media?.name,
+        draftAt: draft.savedAt,
+      });
+      notice.textContent = "Recovering from the previous session after a crash...";
+      await restoreDraft(draft);
+    }
+  }
+  try {
+    localStorage.setItem(CLEAN_CLOSE_KEY, "0");
+  } catch {
+    // ignore
+  }
 }
 
 initialize();

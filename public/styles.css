@@ -730,6 +730,28 @@ video::-webkit-media-controls {
   color: #babcaf;
 }
 
+.recovery-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.65rem 0.9rem;
+  margin-block: 0.75rem;
+  border: 1px solid #57594f;
+  border-left: 3px solid #f0a36e;
+  background: #1a1b16;
+  color: #e8e7df;
+  font-size: 0.82rem;
+}
+
+.recovery-bar[hidden] {
+  display: none;
+}
+
+.recovery-bar span {
+  flex: 1;
+  line-height: 1.45;
+}
+
 .file-list {
   display: grid;
   margin: 0;

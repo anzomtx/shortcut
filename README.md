@@ -19,6 +19,8 @@ Shortcut provides:
 - "Only fast encode edits" preference that snaps every mark to a keyframe and disables frame-accurate export
 - Server admin console with live activity log, force stop, reset, and shutdown controls
 - A double-clickable macOS launcher that starts the server and opens the browser
+- Automatic session recovery: edits are autosaved locally and restored after an unexpected crash
+- Crash and client error logging under `logs/`, and a supervisor that restarts the server after a crash
 
 ## Requirements
 
@@ -47,7 +49,13 @@ For automatic server restarts during development:
 MEDIA_ROOT="/path/to/videos" npm run dev
 ```
 
-On macOS you can double-click `Shortcut Launcher.command` to start the server and open the browser automatically. Use the **Shut down** button in the admin console (or press Ctrl+C in the terminal) to stop it.
+On macOS you can double-click `Shortcut Launcher.command` to start the server and open the browser automatically. The launcher runs the server under a supervisor (`scripts/supervise.mjs`) that restarts it automatically if it crashes and stops cleanly when you use the **Shut down** button (or press Ctrl+C).
+
+## Crash recovery and logging
+
+Edits are autosaved to the browser's local storage after every change, along with the source filename. If the previous session closed without a clean unload (a crash, the browser tab being killed, or the machine losing power), the file and edit list are reloaded automatically. If the session closed cleanly, a **Restore** bar offers to reload the last unsaved session instead.
+
+Client errors, server crashes, and supervisor restarts are recorded as JSON Lines under `logs/` (gitignored) in the repository: `client-errors.jsonl`, `server-errors.jsonl`, and `server-supervisor.log`. The admin console also mirrors client errors as they arrive.
 
 Open <http://127.0.0.1:4173> and click an MP4 filename in the local library, or drop an MP4 anywhere onto the video area — dropped files are located by name on disk and streamed in place, never copied. Files must contain an H.264 video stream.
 
