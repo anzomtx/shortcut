@@ -662,8 +662,9 @@ function exitStillMode(seekTo) {
   pendingTargetUs = null;
   hideStill();
   updateStillIndicator();
-  if (seekTo && Number.isFinite(target) && editMode === "include") {
-    video.currentTime = target / 1_000_000;
+  if (seekTo && Number.isFinite(target)) {
+    if (editMode === "remove") setSequencePlayhead(sourceToSequence(target) ?? 0);
+    else video.currentTime = target / 1_000_000;
   }
 }
 
@@ -850,6 +851,7 @@ async function waitForProxy(media) {
     } catch {
       return;
     }
+    if (!currentMedia || currentMedia.id !== media.id) return;
     if (proxy.status === "ready") {
       applyPreviewSource(proxy);
       notice.textContent = "Preview proxy ready.";
@@ -901,6 +903,7 @@ async function configurePreview(media) {
   }
   try {
     const proxy = await request(`/api/media/${media.id}/proxy`);
+    if (!currentMedia || currentMedia.id !== media.id) return;
     if (proxy.status === "ready") {
       applyPreviewSource(proxy);
       notice.textContent = `${proxy.scale === "half" ? "Half" : "Quarter"}-res preview ready.`;
@@ -934,8 +937,10 @@ async function configureStills(media) {
   stillsProgress.hidden = true;
   stillsProgress.textContent = "";
   if (!media) return;
+  const mediaId = media.id;
   try {
-    const result = await request(`/api/media/${media.id}/stills`);
+    const result = await request(`/api/media/${mediaId}/stills`);
+    if (!currentMedia || currentMedia.id !== mediaId) return;
     stillBaseUrl = result.baseUrl ?? null;
     stillCount = result.count ?? 0;
     if (result.status === "ready") {
@@ -946,7 +951,6 @@ async function configureStills(media) {
         stillsProgress.hidden = false;
         stillsProgress.textContent = `${Math.round(result.progress)}%`;
       }
-      const mediaId = media.id;
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         if (!currentMedia || currentMedia.id !== mediaId) return;
