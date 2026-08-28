@@ -129,7 +129,7 @@ async function scanMp4Files(root, directory = root) {
   return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
-function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, onStderr, children }) {
+function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, onStderr, onSpawn, children }) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       ffmpegPath,
@@ -137,6 +137,7 @@ function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress,
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     children?.add(child);
+    if (onSpawn) onSpawn(child);
     const stderr = [];
     let progress = 0;
     child.stderr.on("data", (chunk) => {
@@ -1172,12 +1173,30 @@ export async function createApp(options = {}) {
     }
   }
 
+  function cancelStillsTasks() {
+    for (const { task } of stillTasks.values()) {
+      if (task.child) {
+        try {
+          task.child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+        task.child = null;
+      }
+      if (task.status === "pending") {
+        task.status = "failed";
+        task.error = "Cancelled due to a preference change";
+      }
+    }
+    stillTasks.clear();
+  }
+
   async function ensureStills(media) {
     const expected = media.analysis.keyframesUs.length;
     if (expected === 0 || expected > STILLS_MAX_COUNT) return { status: "off", count: 0 };
     const key = media.id;
     if (stillTasks.has(key)) return stillTasks.get(key).task;
-    const task = { status: "pending", count: 0, progress: 0, error: null, promise: null };
+    const task = { status: "pending", count: 0, progress: 0, error: null, child: null, promise: null };
     task.promise = (async () => {
       try {
         const directory = path.join(stillRoot, media.id);
@@ -1237,6 +1256,9 @@ export async function createApp(options = {}) {
               for (const match of text.matchAll(/pts_time:([0-9.]+)/g)) {
                 extractedTimestamps.push(Math.round(Number(match[1]) * 1_000_000));
               }
+            },
+            onSpawn: (child) => {
+              task.child = child;
             },
             children: backgroundChildren,
           });
@@ -1582,6 +1604,7 @@ export async function createApp(options = {}) {
 
       if (request.method === "PUT" && url.pathname === "/api/preferences") {
         const nextPreferences = validatePreferences(await readJson(request));
+        const previousStillsScale = preferences.stillsScale;
         await Promise.all([
           mkdir(nextPreferences.libraryPath, { recursive: true }),
           mkdir(nextPreferences.exportPath, { recursive: true }),
@@ -1605,6 +1628,10 @@ export async function createApp(options = {}) {
           exportPath: outputRoot,
         };
         await persistPreferences();
+        if (preferences.stillsScale !== previousStillsScale) {
+          cancelStillsTasks();
+          logAdmin(`Keyframe stills resolution changed to ${preferences.stillsScale}; regenerating`, "warn");
+        }
         if (preferences.previewGeneration && preferences.previewScale !== "source") {
           for (const media of mediaRegistry.values()) {
             ensureProxy(media, preferences.previewScale).catch(() => {});
