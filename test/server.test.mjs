@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -786,4 +786,56 @@ test("generates keyframe stills for dense-GOP files", async () => {
   }
   assert.equal(status.status, "ready");
   assert.equal(status.count, media.keyframeCount);
+});
+
+test("falls back to defaults when a saved folder cannot be found", async () => {
+  const badTmp = await mkdtemp(path.join(os.tmpdir(), "shortcut-badpath-"));
+  const badDataRoot = path.join(badTmp, "data");
+  await mkdir(badDataRoot, { recursive: true });
+  await writeFile(path.join(badTmp, "blocker"), "not a directory");
+  const missingLibrary = path.join(badTmp, "blocker", "videos");
+  await writeFile(
+    path.join(badDataRoot, "preferences.json"),
+    JSON.stringify({
+      version: 1,
+      sidebarCollapsed: true,
+      defaultEditMode: "remove",
+      libraryPath: missingLibrary,
+      exportPath: path.join(badTmp, "missing-exports"),
+      exportNameTemplate: "%o-%m-%h.%ext",
+      importSearchPaths: [],
+      onlyFastEdits: false,
+      previewScale: "source",
+      previewGeneration: true,
+      stillsSeeking: true,
+      shortcuts: {},
+    }),
+  );
+
+  let badServer;
+  try {
+    badServer = await createApp({
+      mediaRoot: path.join(badTmp, "media"),
+      dataRoot: badDataRoot,
+      outputRoot: path.join(badTmp, "out"),
+    });
+    await new Promise((resolve) => badServer.listen(0, "127.0.0.1", resolve));
+    const badBase = `http://127.0.0.1:${badServer.address().port}`;
+
+    const prefs = await (await fetch(`${badBase}/api/preferences`)).json();
+    assert.equal(prefs.libraryPath, missingLibrary);
+    assert.ok(prefs.missingPaths.some((entry) => entry.kind === "library" && entry.path === missingLibrary));
+
+    const files = await (await fetch(`${badBase}/api/files`)).json();
+    assert.equal(files.mediaRoot, await realpath(path.join(badTmp, "media")));
+
+    const restartResponse = await fetch(`${badBase}/api/admin/restart`, { method: "POST" });
+    assert.equal(restartResponse.status, 200);
+    const afterRestart = await (await fetch(`${badBase}/api/preferences`)).json();
+    assert.equal(afterRestart.libraryPath, missingLibrary);
+    assert.ok(afterRestart.missingPaths.some((entry) => entry.kind === "library"));
+  } finally {
+    if (badServer) badServer.close();
+    await rm(badTmp, { recursive: true, force: true });
+  }
 });

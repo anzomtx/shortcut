@@ -903,21 +903,33 @@ export async function createApp(options = {}) {
   const projects = await readProjects(projectsPath);
   const restoredExportJobs = await readExportJobs(exportsPath);
   let preferences = await readPreferences(preferencesPath);
-  const savedMediaRoot = path.resolve(preferences.libraryPath ?? mediaRoot);
-  const savedOutputRoot = path.resolve(preferences.exportPath ?? outputRoot);
-  await Promise.all([
-    mkdir(savedMediaRoot, { recursive: true }),
-    mkdir(savedOutputRoot, { recursive: true }),
-  ]);
-  [mediaRoot, outputRoot] = await Promise.all([
-    realpath(savedMediaRoot),
-    realpath(savedOutputRoot),
-  ]);
-  preferences = {
-    ...preferences,
-    libraryPath: mediaRoot,
-    exportPath: outputRoot,
-  };
+  const missingPaths = [];
+  if (preferences.libraryPath) {
+    const candidate = path.resolve(preferences.libraryPath);
+    try {
+      await mkdir(candidate, { recursive: true });
+      mediaRoot = await realpath(candidate);
+      preferences = { ...preferences, libraryPath: mediaRoot };
+    } catch (error) {
+      missingPaths.push({ kind: "library", path: preferences.libraryPath });
+      console.warn(`Saved library folder unavailable (${error.message}); using default.`);
+    }
+  } else {
+    preferences = { ...preferences, libraryPath: mediaRoot };
+  }
+  if (preferences.exportPath) {
+    const candidate = path.resolve(preferences.exportPath);
+    try {
+      await mkdir(candidate, { recursive: true });
+      outputRoot = await realpath(candidate);
+      preferences = { ...preferences, exportPath: outputRoot };
+    } catch (error) {
+      missingPaths.push({ kind: "export", path: preferences.exportPath });
+      console.warn(`Saved export folder unavailable (${error.message}); using default.`);
+    }
+  } else {
+    preferences = { ...preferences, exportPath: outputRoot };
+  }
   let projectWrite = Promise.resolve();
   let preferenceWrite = Promise.resolve();
   let exportWrite = Promise.resolve();
@@ -1306,7 +1318,7 @@ export async function createApp(options = {}) {
       const url = new URL(request.url, "http://localhost");
 
       if (request.method === "GET" && url.pathname === "/api/preferences") {
-        sendJson(response, 200, preferences);
+        sendJson(response, 200, { ...preferences, missingPaths });
         return;
       }
 
@@ -1363,13 +1375,33 @@ export async function createApp(options = {}) {
         projects.clear();
         for (const [projectId, project] of await readProjects(projectsPath)) projects.set(projectId, project);
         preferences = await readPreferences(preferencesPath);
-        const [resetMediaRoot, resetOutputRoot] = await Promise.all([
-          realpath(path.resolve(preferences.libraryPath ?? configuredRoot)),
-          realpath(path.resolve(preferences.exportPath ?? configuredOutputRoot)),
-        ]);
-        mediaRoot = resetMediaRoot;
-        outputRoot = resetOutputRoot;
-        preferences = { ...preferences, libraryPath: mediaRoot, exportPath: outputRoot };
+        missingPaths.length = 0;
+        if (preferences.libraryPath) {
+          const candidate = path.resolve(preferences.libraryPath);
+          try {
+            await mkdir(candidate, { recursive: true });
+            mediaRoot = await realpath(candidate);
+            preferences = { ...preferences, libraryPath: mediaRoot };
+          } catch (error) {
+            missingPaths.push({ kind: "library", path: preferences.libraryPath });
+            logAdmin(`Saved library folder unavailable: ${preferences.libraryPath}`, "warn");
+          }
+        } else {
+          preferences = { ...preferences, libraryPath: mediaRoot };
+        }
+        if (preferences.exportPath) {
+          const candidate = path.resolve(preferences.exportPath);
+          try {
+            await mkdir(candidate, { recursive: true });
+            outputRoot = await realpath(candidate);
+            preferences = { ...preferences, exportPath: outputRoot };
+          } catch (error) {
+            missingPaths.push({ kind: "export", path: preferences.exportPath });
+            logAdmin(`Saved export folder unavailable: ${preferences.exportPath}`, "warn");
+          }
+        } else {
+          preferences = { ...preferences, exportPath: outputRoot };
+        }
         loggedExportStatuses.clear();
         logAdmin(`Server state reloaded from disk. Library folder: ${mediaRoot}`);
         sendJson(response, 200, { ok: true, libraryPath: mediaRoot, exportPath: outputRoot });

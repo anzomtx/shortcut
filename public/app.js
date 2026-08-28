@@ -48,6 +48,7 @@ const viewerEmpty = document.querySelector("#viewer-empty");
 const viewerTitle = document.querySelector("#viewer-title");
 const metadata = document.querySelector("#media-metadata");
 const rootPath = document.querySelector("#root-path");
+const missingPathWarning = document.querySelector("#missing-path-warning");
 const fileList = document.querySelector("#file-list");
 const notice = document.querySelector("#notice");
 const refreshButton = document.querySelector("#refresh-button");
@@ -782,6 +783,18 @@ async function request(url, options) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error ?? "Request failed");
   return data;
+}
+
+function renderMissingPaths() {
+  const missing = Array.isArray(preferences.missingPaths) ? preferences.missingPaths : [];
+  if (missing.length === 0) {
+    missingPathWarning.hidden = true;
+    return;
+  }
+  missingPathWarning.textContent = missing
+    .map((entry) => `${entry.kind === "export" ? "Export" : "Library"} folder not found: ${entry.path}`)
+    .join(" · ");
+  missingPathWarning.hidden = false;
 }
 
 function reportClientError(level, message, context) {
@@ -1566,6 +1579,7 @@ async function persistPreferences(nextPreferences = preferences) {
     body: JSON.stringify(nextPreferences),
   });
   applySidebarPreference();
+  renderMissingPaths();
 }
 
 function toggleSidebar() {
@@ -2025,6 +2039,7 @@ async function initialize() {
   activatePanelTab("library");
   applySidebarPreference();
   updatePreviewControlsState();
+  renderMissingPaths();
   includeModeButton.classList.toggle("active", editMode === "include");
   removeModeButton.classList.toggle("active", editMode === "remove");
   applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";

@@ -825,6 +825,22 @@ video::-webkit-media-controls {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.missing-path-warning {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #8a5a3a;
+  border-left: 3px solid #f0a36e;
+  background: #201c15;
+  color: #f0a36e;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.missing-path-warning[hidden] {
+  display: none;
+}
+
 .notice {
   min-height: 3rem;
   padding: 0.8rem 0;
