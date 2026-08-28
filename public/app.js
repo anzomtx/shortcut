@@ -946,10 +946,13 @@ async function configureStills(media) {
         stillsProgress.hidden = false;
         stillsProgress.textContent = `${Math.round(result.progress)}%`;
       }
-      for (let attempt = 0; attempt < 360; attempt += 1) {
+      const mediaId = media.id;
+      for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 500));
+        if (!currentMedia || currentMedia.id !== mediaId) return;
         try {
-          const updated = await request(`/api/media/${media.id}/stills`);
+          const updated = await request(`/api/media/${mediaId}/stills`);
+          if (!currentMedia || currentMedia.id !== mediaId) return;
           stillBaseUrl = updated.baseUrl ?? stillBaseUrl;
           stillCount = updated.count ?? stillCount;
           if (updated.status === "ready") {
