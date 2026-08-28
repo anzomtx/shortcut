@@ -18,6 +18,7 @@ const DEFAULT_PREFERENCES = {
   previewScale: "source",
   previewGeneration: true,
   stillsSeeking: true,
+  stillsScale: "half",
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -104,7 +105,11 @@ const stillsSeekingInput = document.querySelector("#stills-seeking");
 const previewControls = document.querySelector("#preview-controls");
 const stillIndicator = document.querySelector("#still-indicator");
 const stillElement = document.querySelector("#keyframe-still");
+const stillsProgress = document.querySelector("#stills-progress");
 const adminStopBackgroundButton = document.querySelector("#admin-stop-background");
+const stillsScaleSelect = document.querySelector("#stills-scale");
+const mediaList = document.querySelector("#media-list");
+const clearMediaButton = document.querySelector("#clear-media");
 const shortcutList = document.querySelector("#shortcut-list");
 const preferencesMessage = document.querySelector("#preferences-message");
 const resetShortcutsButton = document.querySelector("#reset-shortcuts");
@@ -915,6 +920,8 @@ async function configureStills(media) {
   stillsReady = false;
   stillBaseUrl = null;
   stillCount = 0;
+  stillsProgress.hidden = true;
+  stillsProgress.textContent = "";
   if (!media) return;
   try {
     const result = await request(`/api/media/${media.id}/stills`);
@@ -933,9 +940,17 @@ async function configureStills(media) {
             stillsReady = true;
             stillBaseUrl = updated.baseUrl;
             stillCount = updated.count;
+            stillsProgress.hidden = true;
             return;
           }
-          if (updated.status === "failed" || updated.status === "off") return;
+          if (updated.status === "failed" || updated.status === "off") {
+            stillsProgress.hidden = true;
+            return;
+          }
+          if (Number.isFinite(updated.progress)) {
+            stillsProgress.hidden = false;
+            stillsProgress.textContent = `${Math.round(updated.progress)}%`;
+          }
         } catch {
           return;
         }
@@ -1098,6 +1113,88 @@ async function refreshProjects() {
     notice.textContent = error.message;
   }
 }
+
+async function refreshMediaManager() {
+  try {
+    const result = await request("/api/media");
+    renderMediaManager(result.records);
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+}
+
+function renderMediaManager(records) {
+  mediaList.replaceChildren();
+  clearMediaButton.disabled = records.length === 0;
+  if (records.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty-queue";
+    empty.textContent = "No clips have been opened yet. Load a clip to index it here.";
+    mediaList.append(empty);
+    return;
+  }
+  for (const record of records) {
+    const item = document.createElement("li");
+    const title = document.createElement("strong");
+    title.textContent = record.name;
+    const meta = document.createElement("small");
+    meta.textContent = `${record.keyframeCount} keyframes · ${formatBytes(record.size)} · proxy ${record.hasProxies ? "✓" : "–"} · stills ${record.hasStills ? "✓" : "–"}`;
+    const actions = document.createElement("div");
+    actions.className = "media-record-actions";
+    const deleteStills = document.createElement("button");
+    deleteStills.textContent = "stills";
+    deleteStills.title = "Delete keyframe stills for this clip";
+    deleteStills.addEventListener("click", async () => {
+      try {
+        await request(`/api/media/${record.id}/stills`, { method: "DELETE" });
+        await Promise.all([refreshMediaManager(), ifCurrent(record.id, () => configureStills(currentMedia))]);
+      } catch (error) {
+        notice.textContent = error.message;
+      }
+    });
+    const deleteProxies = document.createElement("button");
+    deleteProxies.textContent = "proxy";
+    deleteProxies.title = "Delete proxies for this clip";
+    deleteProxies.addEventListener("click", async () => {
+      try {
+        await request(`/api/media/${record.id}/proxies`, { method: "DELETE" });
+        await refreshMediaManager();
+      } catch (error) {
+        notice.textContent = error.message;
+      }
+    });
+    const deleteRecord = document.createElement("button");
+    deleteRecord.textContent = "delete";
+    deleteRecord.title = "Delete this clip record, its proxies and stills";
+    deleteRecord.addEventListener("click", async () => {
+      if (!window.confirm(`Delete the record for "${record.name}"? Its proxies and keyframe stills are removed too.`)) return;
+      try {
+        await request(`/api/media/${record.id}`, { method: "DELETE" });
+        await refreshMediaManager();
+      } catch (error) {
+        notice.textContent = error.message;
+      }
+    });
+    actions.append(deleteStills, deleteProxies, deleteRecord);
+    item.append(title, meta, actions);
+    mediaList.append(item);
+  }
+}
+
+function ifCurrent(mediaId, run) {
+  if (currentMedia && currentMedia.id === mediaId) run();
+}
+
+clearMediaButton.addEventListener("click", async () => {
+  if (!window.confirm("Delete all clip records, proxies, and keyframe stills?")) return;
+  try {
+    const result = await request("/api/media", { method: "DELETE" });
+    notice.textContent = `Deleted ${result.removed} media record${result.removed === 1 ? "" : "s"}.`;
+    await refreshMediaManager();
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+});
 
 function renderProjects(projects) {
   projectList.replaceChildren();
@@ -1542,6 +1639,7 @@ function activatePanelTab(name) {
     tab.tabIndex = selected ? 0 : -1;
   }
   for (const content of panelContents) content.hidden = content.dataset.panelContent !== name;
+  if (name === "media") refreshMediaManager();
 }
 
 function setPanelWidth(width) {
@@ -1662,6 +1760,7 @@ function openPreferences() {
   exportNameTemplateInput.value = preferencesDraft.exportNameTemplate || DEFAULT_PREFERENCES.exportNameTemplate;
   importSearchPathsInput.value = (preferencesDraft.importSearchPaths ?? []).join("\n");
   onlyFastEditsInput.checked = Boolean(preferencesDraft.onlyFastEdits);
+  stillsScaleSelect.value = preferencesDraft.stillsScale ?? "half";
   previewScaleSelect.value = preferencesDraft.previewScale ?? "source";
   previewGenerationInput.checked = preferencesDraft.previewGeneration !== false;
   stillsSeekingInput.checked = preferencesDraft.stillsSeeking !== false;
@@ -1685,6 +1784,7 @@ async function savePreferences() {
     .map((line) => line.trim())
     .filter(Boolean);
   preferencesDraft.onlyFastEdits = onlyFastEditsInput.checked;
+  preferencesDraft.stillsScale = stillsScaleSelect.value || "half";
   preferencesDraft.previewScale = previewScaleSelect.value || "source";
   preferencesDraft.previewGeneration = previewGenerationInput.checked;
   preferencesDraft.stillsSeeking = stillsSeekingInput.checked;
@@ -1873,7 +1973,19 @@ stillsSeekingInput.addEventListener("change", async () => {
     notice.textContent = error.message;
   }
 });
-timeline.addEventListener("pointerdown", (event) => seekTimeline(event.clientX));
+timeline.addEventListener("pointerdown", (event) => {
+  timeline.setPointerCapture(event.pointerId);
+  seekTimeline(event.clientX);
+});
+timeline.addEventListener("pointermove", (event) => {
+  if (timeline.hasPointerCapture(event.pointerId)) seekTimeline(event.clientX);
+});
+timeline.addEventListener("pointerup", (event) => {
+  if (timeline.hasPointerCapture(event.pointerId)) timeline.releasePointerCapture(event.pointerId);
+});
+timeline.addEventListener("pointercancel", (event) => {
+  if (timeline.hasPointerCapture(event.pointerId)) timeline.releasePointerCapture(event.pointerId);
+});
 timeline.addEventListener("keydown", (event) => {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
   event.preventDefault();
@@ -2044,7 +2156,7 @@ async function initialize() {
   removeModeButton.classList.toggle("active", editMode === "remove");
   applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
   updateControlStates();
-  await Promise.all([refreshLibrary(), refreshProjects(), refreshExportQueue()]);
+  await Promise.all([refreshLibrary(), refreshProjects(), refreshExportQueue(), refreshMediaManager()]);
   window.setInterval(refreshExportQueue, 750);
 
   const draft = readDraft();

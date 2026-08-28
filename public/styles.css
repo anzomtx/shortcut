@@ -347,6 +347,14 @@ main.sidebar-collapsed {
   color: #d1fe3f;
 }
 
+.stills-progress {
+  color: #8f9187;
+}
+
+.stills-progress[hidden] {
+  display: none;
+}
+
 .still-indicator {
   display: inline-flex;
   align-items: center;
@@ -575,6 +583,67 @@ main.sidebar-collapsed {
   padding: 0;
   gap: 0.55rem;
   list-style: none;
+}
+
+.media-list {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  gap: 0.55rem;
+  list-style: none;
+}
+
+.media-list > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.35rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid #34362f;
+  background: #171814;
+}
+
+.media-list strong {
+  color: #e8e7df;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.media-list small {
+  color: #8f9187;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.media-record-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.15rem;
+}
+
+.media-record-actions button {
+  font-size: 0.72rem;
+  padding: 0.22rem 0.55rem;
+  border: 1px solid #4a4c40;
+  border-radius: 0.35rem;
+  background: #23241e;
+  color: #c9cbbf;
+  cursor: pointer;
+}
+
+.media-record-actions button:hover {
+  border-color: #d1fe3f;
+  color: #e8e7df;
+}
+
+.media-record-actions button[data-danger] {
+  border-color: #8a4a3a;
+  color: #f0a36e;
 }
 
 .export-queue-list > li {
@@ -1133,6 +1202,39 @@ video::-webkit-media-controls {
 .shortcut-section {
   display: grid;
   gap: 0.8rem;
+}
+
+.preferences-collapsible {
+  margin-block: 0.25rem;
+  border: 1px solid #34362f;
+  border-radius: 0.45rem;
+  background: #0d0e0c;
+}
+
+.preferences-collapsible summary {
+  padding: 0.75rem 0.9rem;
+  color: #e8e7df;
+  font-size: 0.82rem;
+  font-weight: 650;
+  cursor: pointer;
+  list-style: none;
+}
+
+.preferences-collapsible summary::-webkit-details-marker {
+  display: none;
+}
+
+.preferences-collapsible summary::before {
+  content: "▸ ";
+  color: #d1fe3f;
+}
+
+.preferences-collapsible[open] summary::before {
+  content: "▾ ";
+}
+
+.preferences-collapsible .shortcut-section {
+  padding: 0 0.9rem 0.9rem;
 }
 
 .shortcut-section .step {

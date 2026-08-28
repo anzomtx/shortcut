@@ -57,6 +57,7 @@
             <input type="checkbox" id="stills-seeking" />
             <span>stills</span>
           </label>
+          <output class="stills-progress" id="stills-progress" hidden></output>
           <span class="still-indicator" id="still-indicator" hidden>STILL</span>
           <output class="preview-progress" id="preview-progress" role="status" aria-live="polite"></output>
         </div>
@@ -145,6 +146,7 @@
         <div class="panel-resizer" id="panel-resizer" role="separator" aria-label="Resize right panel" aria-orientation="vertical" tabindex="0"></div>
         <div class="panel-tabs" role="tablist" aria-label="Workspace panel">
           <button type="button" role="tab" id="library-tab" aria-controls="library-tab-panel" aria-selected="true" data-panel-tab="library">Library</button>
+          <button type="button" role="tab" id="media-tab" aria-controls="media-tab-panel" aria-selected="false" data-panel-tab="media">Media</button>
           <button type="button" role="tab" id="projects-tab" aria-controls="projects-tab-panel" aria-selected="false" data-panel-tab="projects">Projects</button>
           <button type="button" role="tab" id="exports-tab" aria-controls="exports-tab-panel" aria-selected="false" data-panel-tab="exports">Export queue</button>
         </div>
@@ -160,6 +162,17 @@
           <p class="root-path" id="root-path"></p>
           <p class="missing-path-warning" id="missing-path-warning" hidden></p>
           <ul class="file-list bounded-list" id="file-list"></ul>
+        </section>
+
+        <section class="panel-tab-content" id="media-tab-panel" role="tabpanel" aria-labelledby="media-tab" data-panel-content="media" hidden>
+          <div class="panel-section-heading">
+            <div>
+              <p class="step">Indexed clips</p>
+              <h2 id="media-title">Media manager</h2>
+            </div>
+            <button type="button" id="clear-media" disabled>Clear all</button>
+          </div>
+          <ul class="media-list bounded-list" id="media-list"></ul>
         </section>
 
         <section class="panel-tab-content" id="projects-tab-panel" role="tabpanel" aria-labelledby="projects-tab" data-panel-content="projects" hidden>
@@ -238,20 +251,33 @@
           <small>Snaps every mark to a keyframe and disables frame-accurate export, so all edits can be exported without re-encoding.</small>
         </label>
 
+        <label class="preference-field" for="stills-scale">
+          <span>Keyframe stills resolution</span>
+          <select id="stills-scale">
+            <option value="full">Full</option>
+            <option value="half">1/2</option>
+            <option value="quarter">1/4</option>
+            <option value="eighth">1/8</option>
+          </select>
+        </label>
+
         <label class="preference-field path-preference" for="import-search-paths">
           <span>Import search folders</span>
           <textarea id="import-search-paths" rows="4" autocomplete="off" spellcheck="false" placeholder="/absolute/folder/one per line"></textarea>
           <small>Dropped files are located by filename in these folders (and the library) — never uploaded or copied.</small>
         </label>
 
-        <section class="shortcut-section" aria-labelledby="shortcuts-title">
-          <div>
-            <p class="step">Input map</p>
-            <h3 id="shortcuts-title">Keyboard shortcuts</h3>
-          </div>
-          <p>Choose a binding, then press the desired key combination. Unassigned actions remain available from the interface.</p>
-          <div id="shortcut-list" class="shortcut-list"></div>
-        </section>
+        <details class="preferences-collapsible" id="shortcuts-collapsible">
+          <summary>Keyboard shortcuts</summary>
+          <section class="shortcut-section" aria-labelledby="shortcuts-title">
+            <div>
+              <p class="step">Input map</p>
+              <h3 id="shortcuts-title">Keyboard shortcuts</h3>
+            </div>
+            <p>Choose a binding, then press the desired key combination. Unassigned actions remain available from the interface.</p>
+            <div id="shortcut-list" class="shortcut-list"></div>
+          </section>
+        </details>
 
         <div class="preferences-message" id="preferences-message" role="status"></div>
         <div class="preferences-actions">

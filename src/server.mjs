@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, open as openFile, appendFile, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open as openFile, appendFile, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -26,6 +26,7 @@ const DEFAULT_PREFERENCES = {
   previewScale: "source",
   previewGeneration: true,
   stillsSeeking: true,
+  stillsScale: "half",
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -644,6 +645,7 @@ function validatePreferences(body) {
     previewScale: body.previewScale === "half" || body.previewScale === "quarter" ? body.previewScale : "source",
     previewGeneration: body.previewGeneration !== false,
     stillsSeeking: body.stillsSeeking !== false,
+    stillsScale: ["full", "half", "quarter", "eighth"].includes(body.stillsScale) ? body.stillsScale : "half",
     shortcuts,
   };
 }
@@ -1100,22 +1102,92 @@ export async function createApp(options = {}) {
   }
 
   const STILLS_MAX_COUNT = 5000;
+  const STILLS_DIVISORS = { full: 1, half: 2, quarter: 4, eighth: 8 };
   const stillTasks = new Map();
+
+  async function deleteMediaProxies(mediaId) {
+    const entries = await readdir(proxyDirectory).catch(() => []);
+    let removed = 0;
+    for (const name of entries) {
+      if (!name.startsWith(`${mediaId}-`)) continue;
+      try {
+        await unlink(path.join(proxyDirectory, name));
+        removed += 1;
+      } catch {
+        // already gone
+      }
+    }
+    return removed;
+  }
+
+  async function deleteMediaStills(mediaId) {
+    const directory = path.join(stillRoot, mediaId);
+    let removed = 0;
+    const entries = await readdir(directory).catch(() => []);
+    for (const name of entries) {
+      try {
+        await unlink(path.join(directory, name));
+        removed += 1;
+      } catch {
+        // already gone
+      }
+    }
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    return removed;
+  }
+
+  async function summarizeMediaRecord(media) {
+    let hasStills = false;
+    try {
+      await readFile(path.join(stillRoot, media.id, "manifest.json"), "utf8");
+      hasStills = true;
+    } catch {
+      // no stills
+    }
+    let hasProxies = false;
+    for (const name of await readdir(proxyDirectory).catch(() => [])) {
+      if (name.startsWith(`${media.id}-`) && name.endsWith(".mp4")) {
+        hasProxies = true;
+        break;
+      }
+    }
+    return {
+      id: media.id,
+      name: media.name,
+      relativePath: media.relativePath,
+      size: media.size,
+      durationUs: media.analysis.durationUs,
+      keyframeCount: media.analysis.keyframesUs.length,
+      hasProxies,
+      hasStills,
+    };
+  }
+
+  function clearProxyTasksFor(mediaId) {
+    for (const key of [...proxyTasks.keys()]) {
+      if (key.startsWith(`${mediaId}:`)) proxyTasks.delete(key);
+    }
+  }
 
   async function ensureStills(media) {
     const expected = media.analysis.keyframesUs.length;
     if (expected === 0 || expected > STILLS_MAX_COUNT) return { status: "off", count: 0 };
     const key = media.id;
     if (stillTasks.has(key)) return stillTasks.get(key).task;
-    const task = { status: "pending", count: 0, error: null, promise: null };
+    const task = { status: "pending", count: 0, progress: 0, error: null, promise: null };
     task.promise = (async () => {
       try {
         const directory = path.join(stillRoot, media.id);
         const manifestPath = path.join(directory, "manifest.json");
-        const expected = media.analysis.keyframesUs.length;
+        const scale = preferences.stillsScale ?? "half";
         try {
           const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-          if (manifest.sourceSize === media.size && manifest.sourceMtimeMs === media.mtimeMs && manifest.count === expected) {
+          if (
+            manifest.sourceSize === media.size &&
+            manifest.sourceMtimeMs === media.mtimeMs &&
+            manifest.count === expected &&
+            manifest.scale === scale
+          ) {
             task.status = "ready";
             task.count = manifest.count;
             return task;
@@ -1127,14 +1199,17 @@ export async function createApp(options = {}) {
         for (const name of await readdir(directory).catch(() => [])) {
           if (/\.jpg$/i.test(name)) await unlink(path.join(directory, name)).catch(() => {});
         }
-        logAdmin(`Extracting ${expected} keyframe stills for ${media.name}...`);
+        const divisor = STILLS_DIVISORS[scale] ?? 2;
+        const stillWidth = Math.max(2, Math.round(media.analysis.video.width / divisor / 2) * 2);
+        const stillHeight = Math.max(2, Math.round(media.analysis.video.height / divisor / 2) * 2);
+        logAdmin(`Extracting ${expected} ${scale}-res keyframe stills for ${media.name}...`);
         await runFfmpegToFile({
           sourcePath: media.path,
           outputPath: path.join(directory, "kf-%06d.jpg"),
           ffmpegPath,
           args: [
             "-vf",
-            "select='eq(pict_type,I)'",
+            `scale=${stillWidth}:${stillHeight},select='eq(pict_type,I)'`,
             "-vsync",
             "vfr",
             "-q:v",
@@ -1142,7 +1217,10 @@ export async function createApp(options = {}) {
             "-f",
             "image2",
           ],
-          onProgress: () => {},
+          onProgress: (seconds) => {
+            const duration = media.analysis.durationUs / 1_000_000;
+            task.progress = duration > 0 ? Math.min(0.99, seconds / duration) : 0;
+          },
           children: backgroundChildren,
         });
         const extracted = (await readdir(directory)).filter((name) => /\.jpg$/i.test(name)).sort();
@@ -1151,11 +1229,19 @@ export async function createApp(options = {}) {
         }
         await writeFile(
           manifestPath,
-          JSON.stringify({ sourceSize: media.size, sourceMtimeMs: media.mtimeMs, count: extracted.length }),
+          JSON.stringify({
+            sourceSize: media.size,
+            sourceMtimeMs: media.mtimeMs,
+            count: extracted.length,
+            scale,
+            width: stillWidth,
+            height: stillHeight,
+          }),
         );
         task.status = "ready";
         task.count = extracted.length;
-        logAdmin(`Extracted ${extracted.length} keyframe stills for ${media.name}`);
+        task.progress = 1;
+        logAdmin(`Extracted ${extracted.length} ${scale}-res keyframe stills for ${media.name}`);
       } catch (error) {
         task.status = "failed";
         task.error = error.message;
@@ -1842,6 +1928,7 @@ export async function createApp(options = {}) {
         sendJson(response, 200, {
           status: task.status,
           count: task.count,
+          progress: task.status === "pending" ? Math.round(task.progress * 100) : null,
           error: task.error ?? null,
           baseUrl: `/api/media/${media.id}/still/`,
         });
@@ -1872,6 +1959,72 @@ export async function createApp(options = {}) {
           "X-Content-Type-Options": "nosniff",
         });
         response.end(contents);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/media") {
+        const records = await Promise.all([...mediaRegistry.values()].map(summarizeMediaRecord));
+        sendJson(response, 200, { records });
+        return;
+      }
+
+      const mediaDeleteMatch = /^\/api\/media\/([a-f0-9]{24})$/.exec(url.pathname);
+      if (request.method === "DELETE" && mediaDeleteMatch) {
+        const media = mediaRegistry.get(mediaDeleteMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        await deleteMediaProxies(media.id);
+        await deleteMediaStills(media.id);
+        mediaRegistry.delete(media.id);
+        clearProxyTasksFor(media.id);
+        stillTasks.delete(media.id);
+        logAdmin(`Deleted media record ${media.name} with proxies and stills`, "warn");
+        sendJson(response, 200, { removed: true });
+        return;
+      }
+
+      const mediaStillsDeleteMatch = /^\/api\/media\/([a-f0-9]{24})\/stills$/.exec(url.pathname);
+      if (request.method === "DELETE" && mediaStillsDeleteMatch) {
+        const media = mediaRegistry.get(mediaStillsDeleteMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        const removed = await deleteMediaStills(media.id);
+        stillTasks.delete(media.id);
+        logAdmin(`Deleted ${removed} still file${removed === 1 ? "" : "s"} for ${media.name}`, "warn");
+        sendJson(response, 200, { removed });
+        return;
+      }
+
+      const mediaProxiesDeleteMatch = /^\/api\/media\/([a-f0-9]{24})\/proxies$/.exec(url.pathname);
+      if (request.method === "DELETE" && mediaProxiesDeleteMatch) {
+        const media = mediaRegistry.get(mediaProxiesDeleteMatch[1]);
+        if (!media) {
+          sendJson(response, 404, { error: "Media is not registered" });
+          return;
+        }
+        const removed = await deleteMediaProxies(media.id);
+        clearProxyTasksFor(media.id);
+        logAdmin(`Deleted ${removed} proxy file${removed === 1 ? "" : "s"} for ${media.name}`, "warn");
+        sendJson(response, 200, { removed });
+        return;
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/media") {
+        let removedRecords = 0;
+        for (const media of [...mediaRegistry.values()]) {
+          await deleteMediaProxies(media.id);
+          await deleteMediaStills(media.id);
+          removedRecords += 1;
+        }
+        mediaRegistry.clear();
+        proxyTasks.clear();
+        stillTasks.clear();
+        logAdmin(`Deleted ${removedRecords} media record${removedRecords === 1 ? "" : "s"} with proxies and stills`, "warn");
+        sendJson(response, 200, { removed: removedRecords });
         return;
       }
 

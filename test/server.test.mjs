@@ -839,3 +839,53 @@ test("falls back to defaults when a saved folder cannot be found", async () => {
     await rm(badTmp, { recursive: true, force: true });
   }
 });
+
+test("lists and deletes media records with their proxies and stills", async () => {
+  const media = await registerSample();
+  const prefs = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewScale: "quarter", stillsScale: "eighth" }),
+  });
+
+  const deadline = Date.now() + 30_000;
+  let proxyReady = false;
+  let stillsReady = false;
+  while ((!proxyReady || !stillsReady) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const proxy = await (await fetch(`${baseUrl}/api/media/${media.id}/proxy`)).json();
+    const stills = await (await fetch(`${baseUrl}/api/media/${media.id}/stills`)).json();
+    proxyReady = proxy.status === "ready";
+    stillsReady = stills.status === "ready";
+  }
+  assert.equal(proxyReady, true);
+  assert.equal(stillsReady, true);
+
+  const listResponse = await (await fetch(`${baseUrl}/api/media`)).json();
+  const record = listResponse.records.find((entry) => entry.id === media.id);
+  assert.ok(record);
+  assert.equal(record.hasProxies, true);
+  assert.equal(record.hasStills, true);
+
+  const deleteStillsResponse = await fetch(`${baseUrl}/api/media/${media.id}/stills`, { method: "DELETE" });
+  assert.equal(deleteStillsResponse.status, 200);
+  const afterStills = await (await fetch(`${baseUrl}/api/media`)).json();
+  assert.equal(afterStills.records.find((entry) => entry.id === media.id).hasStills, false);
+
+  const deleteProxiesResponse = await fetch(`${baseUrl}/api/media/${media.id}/proxies`, { method: "DELETE" });
+  assert.equal(deleteProxiesResponse.status, 200);
+  const afterProxies = await (await fetch(`${baseUrl}/api/media`)).json();
+  assert.equal(afterProxies.records.find((entry) => entry.id === media.id).hasProxies, false);
+
+  const deleteResponse = await fetch(`${baseUrl}/api/media/${media.id}`, { method: "DELETE" });
+  assert.equal(deleteResponse.status, 200);
+  const afterDelete = await (await fetch(`${baseUrl}/api/media`)).json();
+  assert.equal(afterDelete.records.some((entry) => entry.id === media.id), false);
+
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewScale: "source", stillsScale: "half" }),
+  });
+});
