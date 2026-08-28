@@ -1203,26 +1203,34 @@ export async function createApp(options = {}) {
         const stillWidth = Math.max(2, Math.round(media.analysis.video.width / divisor / 2) * 2);
         const stillHeight = Math.max(2, Math.round(media.analysis.video.height / divisor / 2) * 2);
         logAdmin(`Extracting ${expected} ${scale}-res keyframe stills for ${media.name}...`);
-        await runFfmpegToFile({
-          sourcePath: media.path,
-          outputPath: path.join(directory, "kf-%06d.jpg"),
-          ffmpegPath,
-          args: [
-            "-vf",
-            `scale=${stillWidth}:${stillHeight},select='eq(pict_type,I)'`,
-            "-vsync",
-            "vfr",
-            "-q:v",
-            "4",
-            "-f",
-            "image2",
-          ],
-          onProgress: (seconds) => {
-            const duration = media.analysis.durationUs / 1_000_000;
-            task.progress = duration > 0 ? Math.min(0.99, seconds / duration) : 0;
-          },
-          children: backgroundChildren,
-        });
+        const progressTimer = setInterval(() => {
+          readdir(directory)
+            .then((names) => {
+              const written = names.filter((name) => /\.jpg$/i.test(name)).length;
+              task.progress = expected > 0 ? Math.min(0.99, written / expected) : 0;
+            })
+            .catch(() => {});
+        }, 300);
+        try {
+          await runFfmpegToFile({
+            sourcePath: media.path,
+            outputPath: path.join(directory, "kf-%06d.jpg"),
+            ffmpegPath,
+            args: [
+              "-vf",
+              `scale=${stillWidth}:${stillHeight},select='eq(pict_type,I)'`,
+              "-vsync",
+              "vfr",
+              "-q:v",
+              "4",
+              "-f",
+              "image2",
+            ],
+            children: backgroundChildren,
+          });
+        } finally {
+          clearInterval(progressTimer);
+        }
         const extracted = (await readdir(directory)).filter((name) => /\.jpg$/i.test(name)).sort();
         if (extracted.length !== expected) {
           throw new Error(`extracted ${extracted.length} stills but indexed ${expected} keyframes`);

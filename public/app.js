@@ -932,8 +932,12 @@ async function configureStills(media) {
       return;
     }
     if (result.status === "pending") {
-      for (let attempt = 0; attempt < 90; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (Number.isFinite(result.progress)) {
+        stillsProgress.hidden = false;
+        stillsProgress.textContent = `${Math.round(result.progress)}%`;
+      }
+      for (let attempt = 0; attempt < 360; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
         try {
           const updated = await request(`/api/media/${media.id}/stills`);
           if (updated.status === "ready") {
