@@ -129,7 +129,7 @@ async function scanMp4Files(root, directory = root) {
   return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
-function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, children }) {
+function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, onStderr, children }) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       ffmpegPath,
@@ -139,7 +139,10 @@ function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress,
     children?.add(child);
     const stderr = [];
     let progress = 0;
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.stderr.on("data", (chunk) => {
+      stderr.push(chunk);
+      if (onStderr) onStderr(chunk.toString("utf8"));
+    });
     child.stdout.on("data", (chunk) => {
       if (!onProgress) return;
       const text = chunk.toString("utf8");
@@ -1185,11 +1188,11 @@ export async function createApp(options = {}) {
           if (
             manifest.sourceSize === media.size &&
             manifest.sourceMtimeMs === media.mtimeMs &&
-            manifest.count === expected &&
-            manifest.scale === scale
+            manifest.scale === scale &&
+            Array.isArray(manifest.entries)
           ) {
             task.status = "ready";
-            task.count = manifest.count;
+            task.count = manifest.count ?? 0;
             return task;
           }
         } catch {
@@ -1202,7 +1205,7 @@ export async function createApp(options = {}) {
         const divisor = STILLS_DIVISORS[scale] ?? 2;
         const stillWidth = Math.max(2, Math.round(media.analysis.video.width / divisor / 2) * 2);
         const stillHeight = Math.max(2, Math.round(media.analysis.video.height / divisor / 2) * 2);
-        logAdmin(`Extracting ${expected} ${scale}-res keyframe stills for ${media.name}...`);
+        logAdmin(`Extracting ${scale}-res keyframe stills for ${media.name}...`);
         const progressTimer = setInterval(() => {
           readdir(directory)
             .then((names) => {
@@ -1212,6 +1215,7 @@ export async function createApp(options = {}) {
             })
             .catch(() => {});
         }, 300);
+        const extractedTimestamps = [];
         try {
           await runFfmpegToFile({
             sourcePath: media.path,
@@ -1219,38 +1223,67 @@ export async function createApp(options = {}) {
             ffmpegPath,
             args: [
               "-vf",
-              `scale=${stillWidth}:${stillHeight},select='eq(pict_type,I)'`,
+              `scale=${stillWidth}:${stillHeight},select='eq(pict_type,I)',showinfo`,
               "-vsync",
               "vfr",
               "-q:v",
               "4",
               "-f",
               "image2",
+              "-loglevel",
+              "info",
             ],
+            onStderr: (text) => {
+              for (const match of text.matchAll(/pts_time:([0-9.]+)/g)) {
+                extractedTimestamps.push(Math.round(Number(match[1]) * 1_000_000));
+              }
+            },
             children: backgroundChildren,
           });
         } finally {
           clearInterval(progressTimer);
         }
         const extracted = (await readdir(directory)).filter((name) => /\.jpg$/i.test(name)).sort();
-        if (extracted.length !== expected) {
-          throw new Error(`extracted ${extracted.length} stills but indexed ${expected} keyframes`);
+        const entries = new Array(expected).fill(null);
+        let matched = 0;
+        for (let index = 0; index < expected; index += 1) {
+          const target = media.analysis.keyframesUs[index];
+          let bestFile = null;
+          let bestDelta = Infinity;
+          extracted.forEach((name, fileIndex) => {
+            const timestamp = extractedTimestamps[fileIndex];
+            if (!Number.isFinite(timestamp)) return;
+            const delta = Math.abs(timestamp - target);
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              bestFile = name;
+            }
+          });
+          if (bestFile && bestDelta <= 150_000) {
+            entries[index] = bestFile;
+            matched += 1;
+          }
+        }
+        if (matched === 0) {
+          throw new Error(`no keyframe stills matched the keyframe index (extracted ${extracted.length}, indexed ${expected})`);
         }
         await writeFile(
           manifestPath,
           JSON.stringify({
             sourceSize: media.size,
             sourceMtimeMs: media.mtimeMs,
-            count: extracted.length,
+            count: matched,
+            expected,
             scale,
             width: stillWidth,
             height: stillHeight,
+            entries,
           }),
         );
         task.status = "ready";
-        task.count = extracted.length;
+        task.count = matched;
         task.progress = 1;
-        logAdmin(`Extracted ${extracted.length} ${scale}-res keyframe stills for ${media.name}`);
+        logAdmin(`Extracted ${matched} of ${expected} ${scale}-res keyframe stills for ${media.name}`);
       } catch (error) {
         task.status = "failed";
         task.error = error.message;
@@ -1952,7 +1985,22 @@ export async function createApp(options = {}) {
           return;
         }
         const index = Number(stillMatch[2]);
-        const filePath = path.join(stillRoot, media.id, `kf-${String(index + 1).padStart(6, "0")}.jpg`);
+        const directory = path.join(stillRoot, media.id);
+        let fileName = null;
+        try {
+          const manifest = JSON.parse(await readFile(path.join(directory, "manifest.json"), "utf8"));
+          if (Array.isArray(manifest.entries) && index >= 0 && index < manifest.entries.length) {
+            fileName = manifest.entries[index];
+          }
+        } catch {
+          // Manifest not ready yet — fall back to order-based lookup during generation.
+          fileName = `kf-${String(index + 1).padStart(6, "0")}.jpg`;
+        }
+        if (!fileName) {
+          sendJson(response, 404, { error: "Still not found" });
+          return;
+        }
+        const filePath = path.join(directory, fileName);
         try {
           const fileStat = await stat(filePath);
           if (!fileStat.isFile()) throw new Error("missing");

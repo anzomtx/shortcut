@@ -626,7 +626,7 @@ function clearStillMode() {
 
 function enterStillMode(sourceUs, sequenceUs) {
   const index = keyframesUs.findIndex((keyframe) => Math.abs(keyframe - sourceUs) <= 80_000);
-  if (index < 0 || index >= stillCount) {
+  if (index < 0) {
     if (editMode === "remove") setSequencePlayhead(sequenceUs ?? sourceToSequence(sourceUs) ?? 0);
     else video.currentTime = sourceUs / 1_000_000;
     return;
@@ -642,6 +642,19 @@ function enterStillMode(sourceUs, sequenceUs) {
   timeline.setAttribute("aria-valuenow", String(Math.round(displayUs)));
   drawTimeline();
 }
+
+stillElement.addEventListener("error", () => {
+  if (!stillMode) return;
+  const target = pendingTargetUs;
+  stillMode = false;
+  pendingTargetUs = null;
+  hideStill();
+  updateStillIndicator();
+  if (Number.isFinite(target)) {
+    if (editMode === "remove") setSequencePlayhead(sourceToSequence(target) ?? 0);
+    else video.currentTime = target / 1_000_000;
+  }
+});
 
 function exitStillMode(seekTo) {
   const target = pendingTargetUs;
