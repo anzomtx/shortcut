@@ -126,7 +126,6 @@ let currentMedia = null;
 let keyframesUs = [];
 let sourceMetadataLine = "";
 let previewIsProxy = false;
-let stillsReady = false;
 let stillBaseUrl = null;
 let stillCount = 0;
 let stillMode = false;
@@ -656,7 +655,7 @@ function exitStillMode(seekTo) {
 }
 
 function seekToKeyframeOrSource(sourceUs, sequenceUs) {
-  if (stillsReady && preferences.stillsSeeking !== false && video.paused) {
+  if (stillBaseUrl && stillCount > 0 && preferences.stillsSeeking !== false && video.paused) {
     enterStillMode(sourceUs, sequenceUs);
     return;
   }
@@ -917,7 +916,6 @@ async function configurePreview(media) {
 
 async function configureStills(media) {
   clearStillMode();
-  stillsReady = false;
   stillBaseUrl = null;
   stillCount = 0;
   stillsProgress.hidden = true;
@@ -925,10 +923,9 @@ async function configureStills(media) {
   if (!media) return;
   try {
     const result = await request(`/api/media/${media.id}/stills`);
+    stillBaseUrl = result.baseUrl ?? null;
+    stillCount = result.count ?? 0;
     if (result.status === "ready") {
-      stillsReady = true;
-      stillBaseUrl = result.baseUrl;
-      stillCount = result.count;
       return;
     }
     if (result.status === "pending") {
@@ -940,10 +937,10 @@ async function configureStills(media) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         try {
           const updated = await request(`/api/media/${media.id}/stills`);
+          stillBaseUrl = updated.baseUrl ?? stillBaseUrl;
+          stillCount = updated.count ?? stillCount;
           if (updated.status === "ready") {
-            stillsReady = true;
-            stillBaseUrl = updated.baseUrl;
-            stillCount = updated.count;
+            stillCount = updated.count ?? stillCount;
             stillsProgress.hidden = true;
             return;
           }

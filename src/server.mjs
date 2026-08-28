@@ -1208,6 +1208,7 @@ export async function createApp(options = {}) {
             .then((names) => {
               const written = names.filter((name) => /\.jpg$/i.test(name)).length;
               task.progress = expected > 0 ? Math.min(0.99, written / expected) : 0;
+              task.count = written;
             })
             .catch(() => {});
         }, 300);
