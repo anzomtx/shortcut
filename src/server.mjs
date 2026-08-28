@@ -25,6 +25,7 @@ const DEFAULT_PREFERENCES = {
   onlyFastEdits: false,
   previewScale: "source",
   previewGeneration: true,
+  stillsSeeking: true,
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -642,6 +643,7 @@ function validatePreferences(body) {
     onlyFastEdits: body.onlyFastEdits === true,
     previewScale: body.previewScale === "half" || body.previewScale === "quarter" ? body.previewScale : "source",
     previewGeneration: body.previewGeneration !== false,
+    stillsSeeking: body.stillsSeeking !== false,
     shortcuts,
   };
 }
@@ -1085,16 +1087,12 @@ export async function createApp(options = {}) {
     return task;
   }
 
-  function hasLargeKeyframeGaps(media) {
-    const keyframes = media.analysis.keyframesUs;
-    return keyframes.length > 1 && keyframes.some((timestamp, index) => index > 0 && timestamp - keyframes[index - 1] > 1_500_000);
-  }
-
+  const STILLS_MAX_COUNT = 5000;
   const stillTasks = new Map();
 
   async function ensureStills(media) {
-    if (!preferences.previewGeneration) return { status: "off", count: 0 };
-    if (!hasLargeKeyframeGaps(media)) return { status: "off", count: 0 };
+    const expected = media.analysis.keyframesUs.length;
+    if (expected === 0 || expected > STILLS_MAX_COUNT) return { status: "off", count: 0 };
     const key = media.id;
     if (stillTasks.has(key)) return stillTasks.get(key).task;
     const task = { status: "pending", count: 0, error: null, promise: null };
@@ -1193,12 +1191,10 @@ export async function createApp(options = {}) {
     };
     mediaRegistry.set(id, media);
     logAdmin(`Registered ${media.name} (${keyframeLabel(analysis)})`);
-    if (preferences.previewGeneration) {
-      if (preferences.previewScale !== "source") {
-        ensureProxy(media, preferences.previewScale).catch(() => {});
-      }
-      ensureStills(media).catch(() => {});
+    if (preferences.previewGeneration && preferences.previewScale !== "source") {
+      ensureProxy(media, preferences.previewScale).catch(() => {});
     }
+    ensureStills(media).catch(() => {});
     return media;
   }
 
@@ -1449,15 +1445,13 @@ export async function createApp(options = {}) {
           exportPath: outputRoot,
         };
         await persistPreferences();
-        if (preferences.previewGeneration) {
-          if (preferences.previewScale !== "source") {
-            for (const media of mediaRegistry.values()) {
-              ensureProxy(media, preferences.previewScale).catch(() => {});
-            }
-          }
+        if (preferences.previewGeneration && preferences.previewScale !== "source") {
           for (const media of mediaRegistry.values()) {
-            ensureStills(media).catch(() => {});
+            ensureProxy(media, preferences.previewScale).catch(() => {});
           }
+        }
+        for (const media of mediaRegistry.values()) {
+          ensureStills(media).catch(() => {});
         }
         logAdmin("Preferences saved");
         sendJson(response, 200, preferences);

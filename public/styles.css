@@ -310,9 +310,37 @@ main.sidebar-collapsed {
   padding: 0 0.2rem;
 }
 
+.preview-scale-select select:disabled {
+  color: #5c5e53;
+  cursor: not-allowed;
+}
+
 .preview-scale-select select option {
   background: #1a1b16;
   color: #e8e7df;
+}
+
+.preview-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #8f9187;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.preview-toggle input[type="checkbox"] {
+  width: 0.8rem;
+  height: 0.8rem;
+  margin: 0;
+  accent-color: #d1fe3f;
+  cursor: pointer;
+}
+
+.preview-toggle input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 
 .preview-progress {

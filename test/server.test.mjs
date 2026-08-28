@@ -705,8 +705,6 @@ test("preview generation can be disabled and background FFmpeg stopped", async (
 
   const proxyStatus = await (await fetch(`${baseUrl}/api/media/${media.id}/proxy`)).json();
   assert.equal(proxyStatus.status, "off");
-  const stillsStatus = await (await fetch(`${baseUrl}/api/media/${media.id}/stills`)).json();
-  assert.equal(stillsStatus.status, "off");
 
   const stopBackgroundResponse = await fetch(`${baseUrl}/api/admin/stop-background`, { method: "POST" });
   assert.equal(stopBackgroundResponse.status, 200);
@@ -718,4 +716,74 @@ test("preview generation can be disabled and background FFmpeg stopped", async (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...prefs, previewGeneration: true }),
   });
+});
+
+test("stills generate independently of the proxy toggle", async () => {
+  const longPath = path.join(temporaryDirectory, "long-gop-stills.mp4");
+  await execFileAsync("ffmpeg", [
+    "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30",
+    "-t", "10",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    "-g", "90", "-keyint_min", "90", "-sc_threshold", "0",
+    longPath,
+  ]);
+
+  const prefs = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewGeneration: false }),
+  });
+
+  const registerResponse = await fetch(`${baseUrl}/api/media`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ relativePath: "long-gop-stills.mp4" }),
+  });
+  assert.equal(registerResponse.status, 201);
+  const media = await registerResponse.json();
+
+  const deadline = Date.now() + 30_000;
+  let status = { status: "pending" };
+  while (status.status === "pending" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    status = await (await fetch(`${baseUrl}/api/media/${media.id}/stills`)).json();
+  }
+  assert.equal(status.status, "ready");
+
+  await fetch(`${baseUrl}/api/preferences`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...prefs, previewGeneration: true }),
+  });
+});
+
+test("generates keyframe stills for dense-GOP files", async () => {
+  const densePath = path.join(temporaryDirectory, "dense-gop.mp4");
+  await execFileAsync("ffmpeg", [
+    "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24",
+    "-t", "3",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    densePath,
+  ]);
+
+  const registerResponse = await fetch(`${baseUrl}/api/media`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ relativePath: "dense-gop.mp4" }),
+  });
+  assert.equal(registerResponse.status, 201);
+  const media = await registerResponse.json();
+  assert.ok(media.keyframeCount >= 1);
+
+  const deadline = Date.now() + 30_000;
+  let status = { status: "pending" };
+  while (status.status === "pending" && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    status = await (await fetch(`${baseUrl}/api/media/${media.id}/stills`)).json();
+  }
+  assert.equal(status.status, "ready");
+  assert.equal(status.count, media.keyframeCount);
 });

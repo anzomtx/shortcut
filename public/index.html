@@ -49,6 +49,14 @@
               <option value="quarter">Quarter</option>
             </select>
           </label>
+          <label class="preview-toggle" for="preview-generation" title="Generate proxies and stills in the background">
+            <input type="checkbox" id="preview-generation" />
+            <span>proxy</span>
+          </label>
+          <label class="preview-toggle" for="stills-seeking" title="Use keyframe stills when seeking to keyframes">
+            <input type="checkbox" id="stills-seeking" />
+            <span>stills</span>
+          </label>
           <span class="still-indicator" id="still-indicator" hidden>STILL</span>
           <output class="preview-progress" id="preview-progress" role="status" aria-live="polite"></output>
         </div>
@@ -227,12 +235,6 @@
           <input id="only-fast-edits" type="checkbox" />
           <span>Only allow fast encode edits</span>
           <small>Snaps every mark to a keyframe and disables frame-accurate export, so all edits can be exported without re-encoding.</small>
-        </label>
-
-        <label class="preference-field checkbox-field" for="preview-generation">
-          <input id="preview-generation" type="checkbox" />
-          <span>Preview generation</span>
-          <small>Generate half/quarter-resolution proxies and keyframe stills in the background for faster preview and seeking. Disable to use the source directly and stop background FFmpeg work.</small>
         </label>
 
         <label class="preference-field path-preference" for="import-search-paths">

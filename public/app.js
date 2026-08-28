@@ -17,6 +17,7 @@ const DEFAULT_PREFERENCES = {
   onlyFastEdits: false,
   previewScale: "source",
   previewGeneration: true,
+  stillsSeeking: true,
   shortcuts: {
     "ui.toggleSidebar": "KeyB",
     "ui.openPreferences": "Mod+Comma",
@@ -98,6 +99,7 @@ const onlyFastEditsInput = document.querySelector("#only-fast-edits");
 const previewScaleSelect = document.querySelector("#preview-scale");
 const previewProgress = document.querySelector("#preview-progress");
 const previewGenerationInput = document.querySelector("#preview-generation");
+const stillsSeekingInput = document.querySelector("#stills-seeking");
 const previewControls = document.querySelector("#preview-controls");
 const stillIndicator = document.querySelector("#still-indicator");
 const stillElement = document.querySelector("#keyframe-still");
@@ -648,7 +650,7 @@ function exitStillMode(seekTo) {
 }
 
 function seekToKeyframeOrSource(sourceUs, sequenceUs) {
-  if (stillsReady && video.paused) {
+  if (stillsReady && preferences.stillsSeeking !== false && video.paused) {
     enterStillMode(sourceUs, sequenceUs);
     return;
   }
@@ -836,9 +838,19 @@ async function waitForProxy(media) {
   }
 }
 
-async function configurePreview(media) {
+function updatePreviewControlsState() {
   const generationEnabled = preferences.previewGeneration !== false;
-  previewControls.hidden = !generationEnabled;
+  previewScaleSelect.disabled = !generationEnabled;
+  previewGenerationInput.checked = preferences.previewGeneration !== false;
+  stillsSeekingInput.checked = preferences.stillsSeeking !== false;
+  if (!generationEnabled) {
+    previewScaleSelect.value = "source";
+  }
+}
+
+async function configurePreview(media) {
+  updatePreviewControlsState();
+  const generationEnabled = preferences.previewGeneration !== false;
   if (!generationEnabled) {
     previewIsProxy = false;
     previewProgress.textContent = "";
@@ -891,7 +903,6 @@ async function configureStills(media) {
   stillBaseUrl = null;
   stillCount = 0;
   if (!media) return;
-  if (preferences.previewGeneration === false) return;
   try {
     const result = await request(`/api/media/${media.id}/stills`);
     if (result.status === "ready") {
@@ -1639,6 +1650,8 @@ function openPreferences() {
   onlyFastEditsInput.checked = Boolean(preferencesDraft.onlyFastEdits);
   previewScaleSelect.value = preferencesDraft.previewScale ?? "source";
   previewGenerationInput.checked = preferencesDraft.previewGeneration !== false;
+  stillsSeekingInput.checked = preferencesDraft.stillsSeeking !== false;
+  updatePreviewControlsState();
   updateExportNameExample();
   capturingActionId = null;
   preferencesMessage.textContent = "";
@@ -1660,6 +1673,7 @@ async function savePreferences() {
   preferencesDraft.onlyFastEdits = onlyFastEditsInput.checked;
   preferencesDraft.previewScale = previewScaleSelect.value || "source";
   preferencesDraft.previewGeneration = previewGenerationInput.checked;
+  preferencesDraft.stillsSeeking = stillsSeekingInput.checked;
   try {
     await persistPreferences(preferencesDraft);
     await refreshLibrary();
@@ -1812,6 +1826,35 @@ previewScaleSelect.addEventListener("change", async () => {
         : `Previewing ${previewScaleSelect.value} resolution...`;
       configurePreview(currentMedia);
     }
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+});
+
+previewGenerationInput.addEventListener("change", async () => {
+  preferences.previewGeneration = previewGenerationInput.checked;
+  if (!preferences.previewGeneration) {
+    previewScaleSelect.value = "source";
+    preferences.previewScale = "source";
+  }
+  updatePreviewControlsState();
+  try {
+    await persistPreferences({ ...preferences });
+    updateExportControls();
+    if (currentMedia) {
+      configurePreview(currentMedia);
+      configureStills(currentMedia);
+    }
+  } catch (error) {
+    notice.textContent = error.message;
+  }
+});
+
+stillsSeekingInput.addEventListener("change", async () => {
+  preferences.stillsSeeking = stillsSeekingInput.checked;
+  if (!preferences.stillsSeeking && stillMode) exitStillMode(true);
+  try {
+    await persistPreferences({ ...preferences });
   } catch (error) {
     notice.textContent = error.message;
   }
@@ -1981,6 +2024,7 @@ async function initialize() {
   editMode = preferences.defaultEditMode;
   activatePanelTab("library");
   applySidebarPreference();
+  updatePreviewControlsState();
   includeModeButton.classList.toggle("active", editMode === "include");
   removeModeButton.classList.toggle("active", editMode === "remove");
   applyRangeButton.textContent = editMode === "remove" ? "Remove range" : "Include range";
