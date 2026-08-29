@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, open as openFile, appendFile, lstat, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, appendFile, lstat, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -72,6 +72,31 @@ function sendJson(response, statusCode, value) {
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function createTaskLimiter(limit) {
+  let active = 0;
+  const waiting = [];
+  const acquire = () => {
+    if (active < limit) {
+      active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => waiting.push(resolve));
+  };
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else active -= 1;
+  };
+  return async (operation) => {
+    await acquire();
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  };
 }
 
 async function appendLogLine(fileName, entry) {
@@ -219,14 +244,39 @@ function runFfprobe(filePath, ffprobePath, args) {
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     const stdout = [];
-    const stderr = [];
+    let stdoutSize = 0;
+    let stderr = "";
+    let settled = false;
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    timeout.unref?.();
 
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.on("error", (error) => reject(new Error(`Unable to run ffprobe: ${error.message}`)));
+    child.stdout.on("data", (chunk) => {
+      stdoutSize += chunk.length;
+      if (stdoutSize > 8 * 1024 * 1024) {
+        child.kill("SIGKILL");
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-64_000);
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error(`Unable to run ffprobe: ${error.message}`));
+    });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (stdoutSize > 8 * 1024 * 1024) {
+        reject(new Error("ffprobe metadata output exceeded 8 MB"));
+        return;
+      }
       if (code !== 0) {
-        reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || "ffprobe failed"));
+        reject(new Error(stderr.trim() || "ffprobe failed"));
         return;
       }
 
@@ -239,183 +289,66 @@ function runFfprobe(filePath, ffprobePath, args) {
   });
 }
 
+function indexKeyframesWithFfprobe(filePath, ffprobePath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      ffprobePath,
+      [
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_packets",
+        "-show_entries", "packet=pts_time,flags",
+        "-of", "csv=p=0",
+        filePath,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const keyframesUs = [];
+    let lineBuffer = "";
+    let stderr = "";
+    let settled = false;
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    timeout.unref?.();
+    const parseLine = (line) => {
+      const [ptsText, flags = ""] = line.trim().split(",");
+      if (!flags.includes("K")) return;
+      const timestampUs = Math.round(Number(ptsText) * 1_000_000);
+      if (Number.isSafeInteger(timestampUs) && timestampUs >= 0) keyframesUs.push(timestampUs);
+    };
+    child.stdout.on("data", (chunk) => {
+      lineBuffer += chunk.toString("utf8");
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop();
+      for (const line of lines) parseLine(line);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-64_000);
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error(`Unable to index keyframes with ffprobe: ${error.message}`));
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (lineBuffer) parseLine(lineBuffer);
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || "ffprobe keyframe indexing failed"));
+        return;
+      }
+      resolve([...new Set(keyframesUs)].sort((left, right) => left - right));
+    });
+  });
+}
+
 function fractionToNumber(value) {
   if (typeof value !== "string") return null;
   const [numerator, denominator] = value.split("/").map(Number);
   if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) return null;
   return numerator / denominator;
-}
-
-// ---------------------------------------------------------------------------
-// MP4 container keyframe indexer
-// Reads stss (sync samples), stts (time-to-sample), and mdhd (timescale)
-// directly from the MP4 atom tree without ffprobe.
-// ---------------------------------------------------------------------------
-
-function parseAtomHeader(buf, offset) {
-  if (offset + 8 > buf.length) return null;
-  const size = buf.readUInt32BE(offset);
-  const type = buf.toString("ascii", offset + 4, offset + 8);
-  let headerSize = 8;
-  let dataSize;
-  if (size === 1) {
-    if (offset + 16 > buf.length) return null;
-    headerSize = 16;
-    dataSize = Number(buf.readBigUInt64BE(offset + 8)) - 16;
-  } else if (size === 0) {
-    dataSize = buf.length - offset - 8;
-  } else {
-    dataSize = size - 8;
-  }
-  if (dataSize < 0) return null;
-  return { type, size, headerSize, dataOffset: offset + headerSize, dataSize };
-}
-
-function findAtom(buf, startOffset, endOffset, targetType) {
-  let pos = startOffset;
-  while (pos + 8 <= endOffset) {
-    const atom = parseAtomHeader(buf, pos);
-    if (!atom || atom.size <= 0) break;
-    if (atom.type === targetType) return atom;
-    pos += atom.size;
-  }
-  return null;
-}
-
-function readMdhdTimescale(buf, dataOffset) {
-  if (dataOffset + 4 > buf.length) return null;
-  const version = buf[dataOffset];
-  const timescaleOffset = dataOffset + (version === 1 ? 20 : 12);
-  if (timescaleOffset + 4 > buf.length) return null;
-  return buf.readUInt32BE(timescaleOffset) || null;
-}
-
-function readStssSamples(buf, dataOffset) {
-  if (dataOffset + 8 > buf.length) return [];
-  const entryCount = buf.readUInt32BE(dataOffset + 4);
-  const samples = [];
-  for (let i = 0; i < entryCount; i++) {
-    const off = dataOffset + 8 + i * 4;
-    if (off + 4 > buf.length) break;
-    samples.push(buf.readUInt32BE(off));
-  }
-  return samples;
-}
-
-function computeKeyframesUsFromStts(buf, dataOffset, keyframeSamples, timescale) {
-  if (keyframeSamples.length === 0 || timescale <= 0) return [];
-  if (dataOffset + 8 > buf.length) return [];
-  const entryCount = buf.readUInt32BE(dataOffset + 4);
-
-  const sorted = [...keyframeSamples].sort((a, b) => a - b);
-  const resultMap = new Map();
-  let processedSamples = 0;
-  let accumulatedTicks = 0;
-  let sortIdx = 0;
-  let pos = dataOffset + 8;
-
-  for (let e = 0; e < entryCount && sortIdx < sorted.length; e++) {
-    if (pos + 8 > buf.length) break;
-    const count = buf.readUInt32BE(pos);
-    const delta = buf.readUInt32BE(pos + 4);
-    pos += 8;
-
-    const entryEnd = processedSamples + count;
-    while (sortIdx < sorted.length && sorted[sortIdx] <= entryEnd) {
-      const sampleNum = sorted[sortIdx];
-      const offset = sampleNum - processedSamples - 1;
-      const ticks = accumulatedTicks + offset * delta;
-      resultMap.set(sampleNum, Math.round((ticks / timescale) * 1_000_000));
-      sortIdx++;
-    }
-
-    processedSamples = entryEnd;
-    accumulatedTicks += count * delta;
-  }
-
-  return [...resultMap.values()].sort((a, b) => a - b);
-}
-
-async function indexKeyframesFromMp4(filePath) {
-  const fd = await openFile(filePath, "r");
-  try {
-    const fileSize = (await fd.stat()).size;
-    let moovOffset = null;
-    let moovSize = null;
-    let pos = 0;
-
-    while (pos + 8 <= fileSize) {
-      const headerBuf = Buffer.alloc(8);
-      await fd.read(headerBuf, 0, 8, pos);
-      const size = headerBuf.readUInt32BE(0);
-      const type = headerBuf.toString("ascii", 4, 8);
-      if (size === 1) {
-        const extBuf = Buffer.alloc(8);
-        await fd.read(extBuf, 0, 8, pos + 8);
-        moovSize = Number(extBuf.readBigUInt64BE(0));
-      } else if (size === 0) {
-        moovSize = fileSize - pos;
-      } else {
-        moovSize = size;
-      }
-      if (type === "moov") {
-        moovOffset = pos;
-        break;
-      }
-      if (moovSize <= 0) break;
-      pos += moovSize;
-    }
-    if (moovOffset === null) return null;
-
-    const moovBuf = Buffer.alloc(moovSize);
-    await fd.read(moovBuf, 0, moovSize, moovOffset);
-
-    let trakAtom = null;
-    let searchPos = 8;
-    while (searchPos + 8 <= moovSize) {
-      const atom = parseAtomHeader(moovBuf, searchPos);
-      if (!atom || atom.size <= 0) break;
-      if (atom.type === "trak") {
-        const mdia = findAtom(moovBuf, atom.dataOffset, atom.dataOffset + atom.dataSize, "mdia");
-        if (mdia) {
-          const hdlr = findAtom(moovBuf, mdia.dataOffset, mdia.dataOffset + mdia.dataSize, "hdlr");
-          if (hdlr && hdlr.dataOffset + 12 <= moovBuf.length) {
-            const handlerType = moovBuf.toString("ascii", hdlr.dataOffset + 8, hdlr.dataOffset + 12);
-            if (handlerType === "vide") {
-              trakAtom = atom;
-              break;
-            }
-          }
-        }
-      }
-      searchPos += atom.size;
-    }
-    if (!trakAtom) return null;
-
-    const mdiaAtom = findAtom(moovBuf, trakAtom.dataOffset, trakAtom.dataOffset + trakAtom.dataSize, "mdia");
-    if (!mdiaAtom) return null;
-
-    const mdhdAtom = findAtom(moovBuf, mdiaAtom.dataOffset, mdiaAtom.dataOffset + mdiaAtom.dataSize, "mdhd");
-    if (!mdhdAtom) return null;
-    const timescale = readMdhdTimescale(moovBuf, mdhdAtom.dataOffset);
-    if (!timescale) return null;
-
-    const minfAtom = findAtom(moovBuf, mdiaAtom.dataOffset, mdiaAtom.dataOffset + mdiaAtom.dataSize, "minf");
-    if (!minfAtom) return null;
-    const stblAtom = findAtom(moovBuf, minfAtom.dataOffset, minfAtom.dataOffset + minfAtom.dataSize, "stbl");
-    if (!stblAtom) return null;
-
-    const stssAtom = findAtom(moovBuf, stblAtom.dataOffset, stblAtom.dataOffset + stblAtom.dataSize, "stss");
-    const sttsAtom = findAtom(moovBuf, stblAtom.dataOffset, stblAtom.dataOffset + stblAtom.dataSize, "stts");
-    if (!stssAtom || !sttsAtom) return null;
-
-    const keyframeSamples = readStssSamples(moovBuf, stssAtom.dataOffset);
-    const keyframesUs = computeKeyframesUsFromStts(moovBuf, sttsAtom.dataOffset, keyframeSamples, timescale);
-
-    return keyframesUs.length > 0 ? keyframesUs : null;
-  } finally {
-    await fd.close();
-  }
 }
 
 async function analyzeMedia(filePath, ffprobePath) {
@@ -432,25 +365,7 @@ async function analyzeMedia(filePath, ffprobePath) {
   const averageFrameRate = fractionToNumber(videoStream.avg_frame_rate);
   const rotationSideData = videoStream.side_data_list?.find((item) => Number.isFinite(item.rotation));
 
-  let keyframesUs = await indexKeyframesFromMp4(filePath);
-  if (!keyframesUs) {
-    const frameProbe = await runFfprobe(filePath, ffprobePath, [
-      "-select_streams",
-      "v:0",
-      "-skip_frame",
-      "nokey",
-      "-show_frames",
-      "-show_entries",
-      "frame=best_effort_timestamp_time",
-    ]);
-    keyframesUs = [
-      ...new Set(
-        (frameProbe.frames ?? [])
-          .map((frame) => Math.round(Number(frame.best_effort_timestamp_time) * 1_000_000))
-          .filter((timestamp) => Number.isSafeInteger(timestamp) && timestamp >= 0),
-      ),
-    ].sort((left, right) => left - right);
-  }
+  const keyframesUs = await indexKeyframesWithFfprobe(filePath, ffprobePath);
 
   return {
     container: probe.format?.format_name ?? null,
@@ -490,7 +405,7 @@ async function analyzeMedia(filePath, ffprobePath) {
 async function readCachedAnalysis(cacheDirectory, mediaId, fileStat) {
   try {
     const cached = JSON.parse(await readFile(path.join(cacheDirectory, `${mediaId}.json`), "utf8"));
-    if (cached.version === 2 && cached.size === fileStat.size && cached.mtimeMs === fileStat.mtimeMs) {
+    if (cached.version === 3 && cached.size === fileStat.size && cached.mtimeMs === fileStat.mtimeMs) {
       return cached.analysis;
     }
   } catch (error) {
@@ -501,10 +416,10 @@ async function readCachedAnalysis(cacheDirectory, mediaId, fileStat) {
 
 async function writeCachedAnalysis(cacheDirectory, mediaId, fileStat, analysis) {
   const cachePath = path.join(cacheDirectory, `${mediaId}.json`);
-  const temporaryPath = `${cachePath}.${process.pid}.tmp`;
+  const temporaryPath = `${cachePath}.${randomUUID()}.tmp`;
   await writeFile(
     temporaryPath,
-    JSON.stringify({ version: 2, size: fileStat.size, mtimeMs: fileStat.mtimeMs, analysis }),
+    JSON.stringify({ version: 3, size: fileStat.size, mtimeMs: fileStat.mtimeMs, analysis }),
   );
   await rename(temporaryPath, cachePath);
 }
@@ -945,6 +860,9 @@ export async function createApp(options = {}) {
   const canonicalProxyDirectory = await realpath(proxyDirectory);
   const canonicalStillRoot = await realpath(stillRoot);
   const mediaRegistry = new Map();
+  const mediaAnalysisTasks = new Map();
+  const runMediaAnalysis = createTaskLimiter(2);
+  const runBackgroundTask = createTaskLimiter(2);
   const projects = await readProjects(projectsPath);
   const restoredExportJobs = await readExportJobs(exportsPath);
   let preferences = await readPreferences(preferencesPath);
@@ -1096,9 +1014,10 @@ export async function createApp(options = {}) {
     if (proxyTasks.has(key)) return proxyTasks.get(key).task;
     const controller = new AbortController();
     const task = { status: "pending", progress: 0, error: null, dims: null, child: null, controller, promise: null };
-    task.promise = (async () => {
+    task.promise = runBackgroundTask(async () => {
       let tempPath = null;
       try {
+        if (controller.signal.aborted) throw new DOMException("Background task stopped", "AbortError");
         if (await isProxyCurrent(media, scale)) {
           const sidecar = await readProxySidecar(media.id, scale);
           task.status = "ready";
@@ -1177,7 +1096,7 @@ export async function createApp(options = {}) {
         if (tempPath) await rm(tempPath, { force: true }).catch(() => {});
       }
       return task;
-    })();
+    });
     proxyTasks.set(key, { task });
     task.promise.catch(() => {});
     return task;
@@ -1271,8 +1190,9 @@ export async function createApp(options = {}) {
     if (stillTasks.has(key)) return stillTasks.get(key).task;
     const controller = new AbortController();
     const task = { status: "pending", count: 0, progress: 0, error: null, child: null, controller, promise: null };
-    task.promise = (async () => {
+    task.promise = runBackgroundTask(async () => {
       try {
+        if (controller.signal.aborted) throw new DOMException("Background task stopped", "AbortError");
         const directory = path.join(stillRoot, media.id);
         const manifestPath = path.join(directory, "manifest.json");
         const scale = preferences.stillsScale ?? "half";
@@ -1292,6 +1212,9 @@ export async function createApp(options = {}) {
           // no manifest yet
         }
         await mkdir(directory, { recursive: true });
+        await unlink(manifestPath).catch((error) => {
+          if (error.code !== "ENOENT") throw error;
+        });
         for (const name of await readdir(directory).catch(() => [])) {
           if (/\.jpg$/i.test(name)) await unlink(path.join(directory, name)).catch(() => {});
         }
@@ -1309,6 +1232,13 @@ export async function createApp(options = {}) {
             .catch(() => {});
         }, 300);
         const extractedTimestamps = [];
+        let showInfoBuffer = "";
+        const parseShowInfoLine = (line) => {
+          const match = /pts_time:([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)/i.exec(line);
+          if (!match) return;
+          const timestampUs = Math.round(Number(match[1]) * 1_000_000);
+          if (Number.isSafeInteger(timestampUs)) extractedTimestamps.push(timestampUs);
+        };
         try {
           await runFfmpegToFile({
             sourcePath: media.path,
@@ -1316,7 +1246,7 @@ export async function createApp(options = {}) {
             ffmpegPath,
             args: [
               "-vf",
-              `scale=${stillWidth}:${stillHeight},select='eq(pict_type,I)',showinfo`,
+              `scale=${stillWidth}:${stillHeight},select='eq(key,1)',showinfo`,
               "-vsync",
               "vfr",
               "-q:v",
@@ -1327,9 +1257,10 @@ export async function createApp(options = {}) {
               "info",
             ],
             onStderr: (text) => {
-              for (const match of text.matchAll(/pts_time:([0-9.]+)/g)) {
-                extractedTimestamps.push(Math.round(Number(match[1]) * 1_000_000));
-              }
+              showInfoBuffer += text;
+              const lines = showInfoBuffer.split("\n");
+              showInfoBuffer = lines.pop();
+              for (const line of lines) parseShowInfoLine(line);
             },
             onSpawn: (child) => {
               task.child = child;
@@ -1340,32 +1271,32 @@ export async function createApp(options = {}) {
         } finally {
           clearInterval(progressTimer);
         }
+        if (showInfoBuffer) parseShowInfoLine(showInfoBuffer);
         const extracted = (await readdir(directory)).filter((name) => /\.jpg$/i.test(name)).sort();
         const entries = new Array(expected).fill(null);
         let matched = 0;
+        let fileCursor = 0;
         for (let index = 0; index < expected; index += 1) {
           const target = media.analysis.keyframesUs[index];
-          let bestFile = null;
-          let bestDelta = Infinity;
-          extracted.forEach((name, fileIndex) => {
-            const timestamp = extractedTimestamps[fileIndex];
-            if (!Number.isFinite(timestamp)) return;
-            const delta = Math.abs(timestamp - target);
-            if (delta < bestDelta) {
-              bestDelta = delta;
-              bestFile = name;
-            }
-          });
-          if (bestFile && bestDelta <= 150_000) {
-            entries[index] = bestFile;
+          while (
+            fileCursor + 1 < extracted.length &&
+            Math.abs(extractedTimestamps[fileCursor + 1] - target) <= Math.abs(extractedTimestamps[fileCursor] - target)
+          ) {
+            fileCursor += 1;
+          }
+          const timestamp = extractedTimestamps[fileCursor];
+          if (extracted[fileCursor] && Number.isFinite(timestamp) && Math.abs(timestamp - target) <= 150_000) {
+            entries[index] = extracted[fileCursor];
             matched += 1;
+            fileCursor += 1;
           }
         }
         if (matched === 0) {
           throw new Error(`no keyframe stills matched the keyframe index (extracted ${extracted.length}, indexed ${expected})`);
         }
+        const temporaryManifestPath = `${manifestPath}.${randomUUID()}.tmp`;
         await writeFile(
-          manifestPath,
+          temporaryManifestPath,
           JSON.stringify({
             sourceSize: media.size,
             sourceMtimeMs: media.mtimeMs,
@@ -1377,6 +1308,7 @@ export async function createApp(options = {}) {
             entries,
           }),
         );
+        await rename(temporaryManifestPath, manifestPath);
         task.status = "ready";
         task.count = matched;
         task.progress = 1;
@@ -1389,7 +1321,7 @@ export async function createApp(options = {}) {
         task.child = null;
       }
       return task;
-    })();
+    });
     stillTasks.set(key, { task });
     task.promise.catch(() => {});
     return task;
@@ -1407,9 +1339,17 @@ export async function createApp(options = {}) {
     const id = createHash("sha256").update(filePath).digest("hex").slice(0, 24);
     let analysis = await readCachedAnalysis(cacheDirectory, id, fileStat);
     if (!analysis) {
-      logAdmin(`Analyzing ${path.basename(filePath)} with ffprobe...`);
-      analysis = await analyzeMedia(filePath, ffprobePath);
-      if (analysis) await writeCachedAnalysis(cacheDirectory, id, fileStat, analysis);
+      let analysisTask = mediaAnalysisTasks.get(id);
+      if (!analysisTask) {
+        analysisTask = runMediaAnalysis(async () => {
+          logAdmin(`Analyzing ${path.basename(filePath)} with ffprobe...`);
+          const result = await analyzeMedia(filePath, ffprobePath);
+          if (result) await writeCachedAnalysis(cacheDirectory, id, fileStat, result);
+          return result;
+        }).finally(() => mediaAnalysisTasks.delete(id));
+        mediaAnalysisTasks.set(id, analysisTask);
+      }
+      analysis = await analysisTask;
     }
     if (!analysis || analysis.video.codec !== "h264") {
       logAdmin(`${path.basename(filePath)} rejected: no H.264 video stream`, "error");
@@ -2171,7 +2111,7 @@ export async function createApp(options = {}) {
         response.writeHead(200, {
           "Content-Type": "image/jpeg",
           "Content-Length": contents.length,
-          "Cache-Control": "private, max-age=31536000",
+          "Cache-Control": "private, no-cache",
           "X-Content-Type-Options": "nosniff",
         });
         response.end(contents);

@@ -123,6 +123,19 @@ test("lists, registers, and range-streams an H.264 MP4", async () => {
   const keyframes = await keyframesResponse.json();
   assert.equal(keyframes.timeUnit, "microseconds");
   assert.equal(keyframes.keyframesUs[0], 0);
+  const { stdout: packetOutput } = await execFileAsync("ffprobe", [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_packets",
+    "-show_entries", "packet=pts_time,flags",
+    "-of", "csv=p=0",
+    path.join(temporaryDirectory, "sample.mp4"),
+  ]);
+  const packetKeyframesUs = packetOutput.trim().split("\n")
+    .map((line) => line.split(","))
+    .filter(([, flags]) => flags?.includes("K"))
+    .map(([pts]) => Math.round(Number(pts) * 1_000_000));
+  assert.deepEqual(keyframes.keyframesUs, packetKeyframesUs);
 
   const headResponse = await fetch(`${baseUrl}${media.streamUrl}`, { method: "HEAD" });
   assert.equal(headResponse.status, 200);
