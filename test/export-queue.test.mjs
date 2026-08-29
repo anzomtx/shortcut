@@ -91,3 +91,19 @@ test("restores paused jobs and clears the complete queue", async () => {
   assert.equal(queue.clear(), 1);
   assert.deepEqual(queue.list(), []);
 });
+
+test("does not allow cancellation after finalization starts", async () => {
+  let releaseFinalization;
+  const queue = new ExportQueue({
+    runner: async (_job, control) => {
+      control.setFinalizing();
+      await new Promise((resolve) => { releaseFinalization = resolve; });
+    },
+  });
+
+  queue.add(createJob("1"));
+  await waitForStatus(queue, "1", "finalizing");
+  assert.equal(queue.stop("1"), false);
+  releaseFinalization();
+  await waitForStatus(queue, "1", "completed");
+});

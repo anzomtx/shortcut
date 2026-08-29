@@ -36,6 +36,12 @@ export class ExportQueue {
     return jobs.length;
   }
 
+  remove(id) {
+    if (this.#controls.has(id) || !this.#jobs.delete(id)) return false;
+    this.#notify(null);
+    return true;
+  }
+
   pause(id) {
     const job = this.#jobs.get(id);
     if (!job || (job.status !== "queued" && job.status !== "running")) return false;
@@ -76,7 +82,7 @@ export class ExportQueue {
 
   stop(id) {
     const job = this.#jobs.get(id);
-    if (!job || ["completed", "failed", "stopped", "stopping"].includes(job.status)) return false;
+    if (!job || ["completed", "failed", "stopped", "stopping", "finalizing"].includes(job.status)) return false;
     const control = this.#controls.get(id);
     if (!control) {
       job.status = "stopped";
@@ -128,6 +134,10 @@ export class ExportQueue {
         if (!control.paused) return;
         await new Promise((resolve) => control.resumeWaiters.push(resolve));
         if (control.stopRequested) throw new DOMException("Export stopped", "AbortError");
+      },
+      setFinalizing: () => {
+        job.status = "finalizing";
+        this.#notify(job);
       },
     };
 

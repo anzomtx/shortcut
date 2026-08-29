@@ -1449,7 +1449,7 @@ function renderExportQueue(jobs) {
   exportQueueList.replaceChildren();
   clearExportQueueButton.disabled = jobs.length === 0;
   startExportQueueButton.disabled = !jobs.some((job) => job.status === "paused");
-  const activeJobs = jobs.filter((job) => ["queued", "running", "paused", "stopping"].includes(job.status));
+  const activeJobs = jobs.filter((job) => ["queued", "running", "paused", "stopping", "finalizing"].includes(job.status));
   exportQueueSummary.value = activeJobs.length === 0
     ? jobs.length === 0 ? "Queue empty" : "No active jobs"
     : `${activeJobs.length} active job${activeJobs.length === 1 ? "" : "s"}`;

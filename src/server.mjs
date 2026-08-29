@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { exportFrameAccurate, exportStreamCopy, isKeyframeAligned } from "./exporter.mjs";
+import { exportFrameAccurate, exportStreamCopy, isKeyframeAligned, verifyMediaSource } from "./exporter.mjs";
 import { ExportQueue } from "./export-queue.mjs";
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -512,6 +512,7 @@ async function readExportJobs(exportsPath) {
       startedAt: ["completed", "failed", "stopped"].includes(job.status) ? job.startedAt : null,
       media: {
         path: job.sourcePath,
+        sourceIdentity: job.sourceIdentity ?? null,
         analysis: { audio: job.hasAudio ? [{}] : [] },
       },
     }));
@@ -536,6 +537,7 @@ function serializePersistedExport(job) {
     completedAt: job.completedAt,
     startedAt: job.startedAt ?? null,
     sourcePath: job.media.path,
+    sourceIdentity: job.media.sourceIdentity,
     hasAudio: job.media.analysis.audio.length > 0,
     segments: job.segments,
   };
@@ -1349,6 +1351,12 @@ export async function createApp(options = {}) {
       path: filePath,
       size: fileStat.size,
       mtimeMs: fileStat.mtimeMs,
+      sourceIdentity: {
+        size: fileStat.size,
+        mtimeMs: fileStat.mtimeMs,
+        dev: fileStat.dev,
+        ino: fileStat.ino,
+      },
       analysis,
     };
     mediaRegistry.set(id, media);
@@ -1433,6 +1441,7 @@ export async function createApp(options = {}) {
           if (job.status === "running") logAdmin(`Exporting ${label}...`);
           else if (job.status === "paused") logAdmin(`Export paused: ${label}`);
           else if (job.status === "stopping") logAdmin(`Stopping export ${label}...`);
+          else if (job.status === "finalizing") logAdmin(`Finalizing export ${label}...`);
           else if (job.status === "completed") logAdmin(`Export completed: ${label}`);
           else if (job.status === "stopped") logAdmin(`Export stopped: ${label}`, "warn");
           else if (job.status === "failed") logAdmin(`Export failed: ${label} (${job.error ?? "unknown error"})`, "error");
@@ -1441,6 +1450,7 @@ export async function createApp(options = {}) {
       persistExportJobs(jobs).catch((error) => console.error("Unable to persist export queue", error));
     },
     runner: async (job, control) => {
+      await verifyMediaSource(job.media);
       const exportOptions = {
         ffmpegPath,
         media: job.media,
@@ -1449,6 +1459,7 @@ export async function createApp(options = {}) {
         signal: control.signal,
         setProcess: control.setProcess,
         waitIfPaused: control.waitIfPaused,
+        onFinalizing: control.setFinalizing,
         onProgress: (progress) => {
           if (Number.isFinite(progress)) {
             job.progress = Math.max(job.progress, Math.round(progress * 1_000) / 1_000);
@@ -1705,6 +1716,25 @@ export async function createApp(options = {}) {
 
         const id = randomUUID();
         const outputName = createExportName(project, body.mode, body.outputName, id, preferences.exportNameTemplate);
+        const outputPath = path.join(outputRoot, outputName);
+        const reserved = exportQueue.list().some(
+          (candidate) => candidate.outputName.toLowerCase() === outputName.toLowerCase(),
+        );
+        if (reserved || await stat(outputPath).then(() => true, (error) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        })) {
+          const error = new Error(`Export destination already exists or is reserved: ${outputName}`);
+          error.statusCode = 409;
+          throw error;
+        }
+        if (exportQueue.list().some(
+          (candidate) => candidate.outputName.toLowerCase() === outputName.toLowerCase(),
+        )) {
+          const error = new Error(`Export destination is already reserved: ${outputName}`);
+          error.statusCode = 409;
+          throw error;
+        }
         const job = {
           id,
           projectId: project.id,
@@ -1713,7 +1743,7 @@ export async function createApp(options = {}) {
           status: "paused",
           progress: 0,
           outputName,
-          outputPath: path.join(outputRoot, outputName),
+          outputPath,
           error: null,
           createdAt: new Date().toISOString(),
           completedAt: null,
@@ -1722,7 +1752,13 @@ export async function createApp(options = {}) {
           segments: project.segments.map((segment) => ({ ...segment })),
         };
         exportQueue.add(job);
-        await exportWrite;
+        try {
+          await exportWrite;
+        } catch (error) {
+          exportQueue.remove(job.id);
+          await exportWrite.catch(() => {});
+          throw error;
+        }
         sendJson(response, 202, serializeExport(job));
         return;
       }

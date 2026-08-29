@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 function seconds(timestampUs) {
@@ -55,9 +55,8 @@ async function runFfmpeg(ffmpegPath, args, options = {}) {
   });
 }
 
-export function isKeyframeAligned(keyframesUs, timestampUs) {
+export function isKeyframeAligned(keyframesUs, timestampUs, toleranceUs = 1) {
   if (!Array.isArray(keyframesUs) || keyframesUs.length === 0) return false;
-  if (timestampUs <= keyframesUs[0]) return true;
   let low = 0;
   let high = keyframesUs.length;
   while (low < high) {
@@ -66,8 +65,32 @@ export function isKeyframeAligned(keyframesUs, timestampUs) {
     else high = middle;
   }
   return [keyframesUs[low - 1], keyframesUs[low]].some(
-    (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= 80_000,
+    (keyframe) => Number.isFinite(keyframe) && Math.abs(keyframe - timestampUs) <= toleranceUs,
   );
+}
+
+export async function verifyMediaSource(media) {
+  const expected = media.sourceIdentity;
+  if (!expected) throw new Error("Export source identity is unavailable; recreate this export job");
+  const current = await stat(media.path);
+  if (
+    current.size !== expected.size ||
+    current.mtimeMs !== expected.mtimeMs ||
+    current.dev !== expected.dev ||
+    current.ino !== expected.ino
+  ) {
+    throw new Error("Export source changed after this job was created; recreate the export job");
+  }
+}
+
+async function publishOutput(temporaryOutput, outputPath) {
+  try {
+    await link(temporaryOutput, outputPath);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error(`Export destination already exists: ${path.basename(outputPath)}`);
+    throw error;
+  }
+  await rm(temporaryOutput, { force: true }).catch(() => {});
 }
 
 export async function exportStreamCopy({
@@ -80,6 +103,7 @@ export async function exportStreamCopy({
   signal,
   setProcess,
   waitIfPaused,
+  onFinalizing,
 }) {
   await Promise.all([mkdir(path.dirname(outputPath), { recursive: true }), mkdir(workRoot, { recursive: true })]);
   const workDirectory = await mkdtemp(path.join(workRoot, "fast-"));
@@ -165,10 +189,13 @@ export async function exportStreamCopy({
         },
       },
     );
-    await rename(temporaryOutput, outputPath);
+    await waitIfPaused?.();
+    if (signal?.aborted) throw new DOMException("Export stopped", "AbortError");
+    onFinalizing?.();
+    await publishOutput(temporaryOutput, outputPath);
     onProgress?.(1);
   } finally {
-    await Promise.all([
+    await Promise.allSettled([
       rm(workDirectory, { recursive: true, force: true }),
       rm(temporaryOutput, { force: true }),
     ]);
@@ -184,6 +211,7 @@ export async function exportFrameAccurate({
   signal,
   setProcess,
   waitIfPaused,
+  onFinalizing,
 }) {
   await mkdir(path.dirname(outputPath), { recursive: true });
   const temporaryOutput = path.join(path.dirname(outputPath), `.${path.basename(outputPath)}.${randomUUID()}.tmp.mp4`);
@@ -238,9 +266,12 @@ export async function exportFrameAccurate({
       beforeProcess: waitIfPaused,
       onProgress: (currentUs) => onProgress?.(Math.min(currentUs / totalDurationUs, 0.99)),
     });
-    await rename(temporaryOutput, outputPath);
+    await waitIfPaused?.();
+    if (signal?.aborted) throw new DOMException("Export stopped", "AbortError");
+    onFinalizing?.();
+    await publishOutput(temporaryOutput, outputPath);
     onProgress?.(1);
   } finally {
-    await rm(temporaryOutput, { force: true });
+    await rm(temporaryOutput, { force: true }).catch(() => {});
   }
 }

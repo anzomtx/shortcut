@@ -312,6 +312,60 @@ test("exports a keyframe-aligned project without re-encoding", async () => {
   assert.equal(stdout.trim(), "h264");
 });
 
+test("rejects export names that already exist or are reserved", async () => {
+  const preferences = await (await fetch(`${baseUrl}/api/preferences`)).json();
+  const protectedPath = path.join(preferences.exportPath, "protected-output.mp4");
+  await writeFile(protectedPath, "keep me");
+
+  const existingResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: savedProject.id,
+      mode: "fast",
+      outputName: "protected-output.mp4",
+    }),
+  });
+  assert.equal(existingResponse.status, 409);
+  assert.equal(await readFile(protectedPath, "utf8"), "keep me");
+
+  const completedResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: savedProject.id,
+      mode: "fast",
+      outputName: "fast-output.mp4",
+    }),
+  });
+  assert.equal(completedResponse.status, 409);
+
+  const firstReservedResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: savedProject.id,
+      mode: "fast",
+      outputName: "reserved-output.mp4",
+    }),
+  });
+  assert.equal(firstReservedResponse.status, 202);
+  const reservedJob = await firstReservedResponse.json();
+
+  const secondReservedResponse = await fetch(`${baseUrl}/api/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectId: savedProject.id,
+      mode: "fast",
+      outputName: "RESERVED-output.mp4",
+    }),
+  });
+  assert.equal(secondReservedResponse.status, 409);
+  const stopResponse = await fetch(`${baseUrl}/api/exports/${reservedJob.id}/stop`, { method: "POST" });
+  assert.equal(stopResponse.status, 200);
+});
+
 test("re-encodes arbitrary edit points for frame-accurate export", async () => {
   const media = registeredMedia ?? (await registerSample());
   const projectResponse = await fetch(`${baseUrl}/api/projects`, {
@@ -472,7 +526,7 @@ test("onlyFastEdits preference disallows frame-accurate exports", async () => {
   const fastResponse = await fetch(`${baseUrl}/api/exports`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ projectId: savedProject.id, mode: "fast" }),
+    body: JSON.stringify({ projectId: savedProject.id, mode: "fast", outputName: "only-fast-output.mp4" }),
   });
   assert.equal(fastResponse.status, 202);
   const job = await fastResponse.json();
@@ -491,7 +545,7 @@ test("starts all paused exports from the queue", async () => {
     const createResponse = await fetch(`${baseUrl}/api/exports`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId: savedProject.id, mode }),
+      body: JSON.stringify({ projectId: savedProject.id, mode, outputName: `start-${mode}-output.mp4` }),
     });
     assert.equal(createResponse.status, 202);
     const job = await createResponse.json();

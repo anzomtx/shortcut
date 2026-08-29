@@ -738,6 +738,7 @@ main.sidebar-collapsed {
 .status-failed,
 .status-stopped,
 .status-stopping,
+.status-finalizing,
 .export-job-error {
   color: #ef6e68;
 }
