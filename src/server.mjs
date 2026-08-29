@@ -424,6 +424,22 @@ async function writeCachedAnalysis(cacheDirectory, mediaId, fileStat, analysis) 
   await rename(temporaryPath, cachePath);
 }
 
+function invalidPersistedData(message) {
+  const error = new Error(message);
+  error.code = "INVALID_PERSISTED_DATA";
+  return error;
+}
+
+async function recoverInvalidPersistence(filePath, error, recoveries) {
+  if (error.code === "ENOENT") return false;
+  if (!(error instanceof SyntaxError) && error.code !== "INVALID_PERSISTED_DATA") throw error;
+  const recoveryPath = `${filePath}.corrupt-${Date.now()}-${randomUUID()}`;
+  await rename(filePath, recoveryPath);
+  recoveries?.push({ name: path.basename(filePath), recoveryPath });
+  console.warn(`Ignored invalid persisted data in ${filePath}; moved it to ${recoveryPath}.`);
+  return true;
+}
+
 function serializeMedia(media) {
   const { keyframesUs, ...metadata } = media.analysis;
   return {
@@ -432,6 +448,7 @@ function serializeMedia(media) {
     relativePath: media.relativePath,
     absolutePath: media.relativePath ? null : media.absolutePath,
     size: media.size,
+    mtimeMs: media.mtimeMs,
     ...metadata,
     keyframeCount: keyframesUs.length,
     streamUrl: `/api/media/${media.id}/stream`,
@@ -440,20 +457,23 @@ function serializeMedia(media) {
   };
 }
 
-async function readProjects(projectsPath) {
+async function readProjects(projectsPath, recoveries) {
   try {
     const projects = JSON.parse(await readFile(projectsPath, "utf8"));
+    if (!Array.isArray(projects) || projects.some((project) => !project || typeof project.id !== "string")) {
+      throw invalidPersistedData("Persisted projects are invalid");
+    }
     return new Map(projects.map((project) => [project.id, project]));
   } catch (error) {
-    if (error.code === "ENOENT") return new Map();
-    throw error;
+    if (await recoverInvalidPersistence(projectsPath, error, recoveries)) return new Map();
+    return new Map();
   }
 }
 
-async function readExportJobs(exportsPath) {
+async function readExportJobs(exportsPath, recoveries) {
   try {
     const jobs = JSON.parse(await readFile(exportsPath, "utf8"));
-    if (!Array.isArray(jobs)) throw new Error("Persisted export queue is invalid");
+    if (!Array.isArray(jobs)) throw invalidPersistedData("Persisted export queue is invalid");
     return jobs.map((job) => ({
       ...job,
       status: ["completed", "failed", "stopped"].includes(job.status) ? job.status : "paused",
@@ -466,8 +486,8 @@ async function readExportJobs(exportsPath) {
       },
     }));
   } catch (error) {
-    if (error.code === "ENOENT") return [];
-    throw error;
+    if (await recoverInvalidPersistence(exportsPath, error, recoveries)) return [];
+    return [];
   }
 }
 
@@ -492,17 +512,20 @@ function serializePersistedExport(job) {
   };
 }
 
-async function readPreferences(preferencesPath) {
+async function readPreferences(preferencesPath, recoveries) {
   try {
     const saved = JSON.parse(await readFile(preferencesPath, "utf8"));
+    if (!saved || typeof saved !== "object" || Array.isArray(saved)) {
+      throw invalidPersistedData("Persisted preferences are invalid");
+    }
     return {
       ...DEFAULT_PREFERENCES,
       ...saved,
       shortcuts: { ...DEFAULT_PREFERENCES.shortcuts, ...saved.shortcuts },
     };
   } catch (error) {
-    if (error.code === "ENOENT") return structuredClone(DEFAULT_PREFERENCES);
-    throw error;
+    if (await recoverInvalidPersistence(preferencesPath, error, recoveries)) return structuredClone(DEFAULT_PREFERENCES);
+    return structuredClone(DEFAULT_PREFERENCES);
   }
 }
 
@@ -658,6 +681,8 @@ function validateProjectInput(body, mediaRegistry) {
       relativePath: media.relativePath,
       absolutePath: media.relativePath ? null : media.absolutePath,
       name: media.name,
+      size: media.size,
+      mtimeMs: media.mtimeMs,
     },
     segments,
   };
@@ -863,9 +888,10 @@ export async function createApp(options = {}) {
   const mediaAnalysisTasks = new Map();
   const runMediaAnalysis = createTaskLimiter(2);
   const runBackgroundTask = createTaskLimiter(2);
-  const projects = await readProjects(projectsPath);
-  const restoredExportJobs = await readExportJobs(exportsPath);
-  let preferences = await readPreferences(preferencesPath);
+  const persistenceRecoveries = [];
+  const projects = await readProjects(projectsPath, persistenceRecoveries);
+  const restoredExportJobs = await readExportJobs(exportsPath, persistenceRecoveries);
+  let preferences = await readPreferences(preferencesPath, persistenceRecoveries);
   const missingPaths = [];
   if (preferences.libraryPath) {
     const candidate = path.resolve(preferences.libraryPath);
@@ -907,6 +933,9 @@ export async function createApp(options = {}) {
   logAdmin("Server started");
   logAdmin(`Library folder: ${mediaRoot}`);
   logAdmin(`Export folder: ${outputRoot}`);
+  for (const recovery of persistenceRecoveries) {
+    logAdmin(`Recovered invalid ${recovery.name}; original data was moved aside`, "warn");
+  }
 
   function persistProjects() {
     projectWrite = projectWrite.catch(() => {}).then(async () => {
@@ -1523,7 +1552,11 @@ export async function createApp(options = {}) {
       }
 
       if (request.method === "GET" && url.pathname === "/api/preferences") {
-        sendJson(response, 200, { ...preferences, missingPaths });
+        sendJson(response, 200, {
+          ...preferences,
+          missingPaths,
+          recoveryWarnings: persistenceRecoveries.map(({ name }) => ({ name })),
+        });
         return;
       }
 
@@ -1563,8 +1596,12 @@ export async function createApp(options = {}) {
         await exportWrite;
         mediaRegistry.clear();
         projects.clear();
-        for (const [projectId, project] of await readProjects(projectsPath)) projects.set(projectId, project);
-        preferences = await readPreferences(preferencesPath);
+        persistenceRecoveries.length = 0;
+        for (const [projectId, project] of await readProjects(projectsPath, persistenceRecoveries)) projects.set(projectId, project);
+        preferences = await readPreferences(preferencesPath, persistenceRecoveries);
+        for (const recovery of persistenceRecoveries) {
+          logAdmin(`Recovered invalid ${recovery.name}; original data was moved aside`, "warn");
+        }
         missingPaths.length = 0;
         if (preferences.libraryPath) {
           const candidate = path.resolve(preferences.libraryPath);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -108,6 +108,7 @@ test("lists, registers, and range-streams an H.264 MP4", async () => {
   assert.equal(media.video.width, 160);
   assert.equal(media.video.height, 90);
   assert.equal(media.size, sampleSize);
+  assert.equal(typeof media.mtimeMs, "number");
   assert.equal(media.durationUs, 1_000_000);
   assert.equal(media.video.codec, "h264");
   assert.equal(media.audio[0].codec, "aac");
@@ -160,6 +161,45 @@ test("lists, registers, and range-streams an H.264 MP4", async () => {
   });
   assert.equal(invalidResponse.status, 416);
   assert.equal(invalidResponse.headers.get("content-range"), `bytes */${sampleSize}`);
+});
+
+test("quarantines corrupt persisted state and starts with defaults", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "shortcut-corrupt-state-"));
+  const dataRoot = path.join(root, "data");
+  await mkdir(dataRoot, { recursive: true });
+  await Promise.all([
+    writeFile(path.join(dataRoot, "projects.json"), "{invalid"),
+    writeFile(path.join(dataRoot, "preferences.json"), "[]"),
+    writeFile(path.join(dataRoot, "exports.json"), "{}"),
+  ]);
+
+  const recoveredServer = await createApp({
+    mediaRoot: path.join(root, "media"),
+    dataRoot,
+    outputRoot: path.join(root, "outputs"),
+  });
+  try {
+    await new Promise((resolve) => recoveredServer.listen(0, "127.0.0.1", resolve));
+    const recoveredBaseUrl = `http://127.0.0.1:${recoveredServer.address().port}`;
+    const [projects, preferences, exports] = await Promise.all([
+      nativeFetch(`${recoveredBaseUrl}/api/projects`).then((response) => response.json()),
+      nativeFetch(`${recoveredBaseUrl}/api/preferences`).then((response) => response.json()),
+      nativeFetch(`${recoveredBaseUrl}/api/exports`).then((response) => response.json()),
+    ]);
+    assert.deepEqual(projects, { projects: [] });
+    assert.equal(preferences.defaultEditMode, "remove");
+    assert.deepEqual(preferences.recoveryWarnings.map(({ name }) => name).sort(), [
+      "exports.json",
+      "preferences.json",
+      "projects.json",
+    ]);
+    assert.deepEqual(exports, { jobs: [] });
+    const quarantined = (await readdir(dataRoot)).filter((name) => name.includes(".corrupt-"));
+    assert.equal(quarantined.length, 3);
+  } finally {
+    await new Promise((resolve, reject) => recoveredServer.close((error) => (error ? reject(error) : resolve())));
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("exposes graceful application shutdown", () => {
@@ -216,6 +256,8 @@ test("persists and updates project edit decision lists", async () => {
   const project = await createResponse.json();
   savedProject = project;
   assert.equal(project.source.relativePath, "sample.mp4");
+  assert.equal(project.source.size, sampleSize);
+  assert.equal(project.source.mtimeMs, media.mtimeMs);
   assert.equal(project.editMode, "remove");
   assert.equal(project.segments.length, 1);
 

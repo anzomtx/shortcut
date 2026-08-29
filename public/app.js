@@ -155,6 +155,10 @@ let mediaLoadGeneration = 0;
 let editorSessionGeneration = 0;
 let saveProjectPromise = null;
 let apiToken = null;
+let previewConfigurationGeneration = 0;
+let stillsConfigurationGeneration = 0;
+let preferenceWrite = Promise.resolve();
+let preferenceRevision = 0;
 
 const ICON_PATHS = {
   open: ["M3 7h6l2 2h10v9H3z", "M3 7V5h7l2 2"],
@@ -448,6 +452,7 @@ function restoreEdit(snapshot) {
   sequencePlayheadUs = snapshot.sequencePlayheadUs;
   selectedSegmentId = snapshot.selectedSegmentId;
   if (editMode === "remove" && segments.length > 0) setSequencePlayhead(sequencePlayheadUs);
+  else if (editMode === "remove") video.pause();
   renderMarks();
   renderSegments();
 }
@@ -467,8 +472,30 @@ function resetHistory() {
 function readDraft() {
   try {
     const raw = localStorage.getItem(DRAFT_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    const valid = draft?.version === 1
+      && draft.media
+      && typeof draft.media.name === "string"
+      && ["include", "remove"].includes(draft.editMode)
+      && Array.isArray(draft.segments)
+      && draft.segments.length <= 10_000
+      && draft.segments.every((segment) => (
+        typeof segment?.id === "string"
+        && Number.isSafeInteger(segment.inUs)
+        && Number.isSafeInteger(segment.outUs)
+        && segment.inUs >= 0
+        && segment.outUs > segment.inUs
+      ));
+    if (valid) return draft;
+    localStorage.removeItem(DRAFT_KEY);
+    return null;
   } catch {
+    try {
+      localStorage.removeItem(DRAFT_KEY);
+    } catch {
+      // ignore
+    }
     return null;
   }
 }
@@ -498,6 +525,8 @@ function persistDraft() {
       name: currentMedia.name,
       relativePath: currentMedia.relativePath,
       absolutePath: currentMedia.absolutePath,
+      size: currentMedia.size,
+      mtimeMs: currentMedia.mtimeMs,
     },
     projectId: currentProjectId,
     projectName: projectName.value || null,
@@ -553,6 +582,13 @@ function removeSequenceRange(startUs, endUs) {
 
 function applyMarkedRange() {
   if (!currentMedia || markOutUs <= markInUs) return;
+  if (editMode === "include") {
+    const overlaps = segments.some((segment) => markInUs < segment.outUs && markOutUs > segment.inUs);
+    if (overlaps) {
+      notice.textContent = "Included ranges cannot overlap.";
+      return;
+    }
+  }
   recordEdit();
   if (editMode === "remove") {
     const removalStartUs = markInUs;
@@ -564,12 +600,6 @@ function applyMarkedRange() {
     else video.pause();
     notice.textContent = "Range removed and the sequence gap closed.";
   } else {
-    const overlaps = segments.some((segment) => markInUs < segment.outUs && markOutUs > segment.inUs);
-    if (overlaps) {
-      undoStack.pop();
-      notice.textContent = "Included ranges cannot overlap.";
-      return;
-    }
     segments.push({ id: crypto.randomUUID(), inUs: markInUs, outUs: markOutUs });
     segments.sort((left, right) => left.inUs - right.inUs);
     notice.textContent = "Range included in the sequence.";
@@ -585,6 +615,7 @@ function removeSelectedSegment() {
   selectedSegmentId = segments[0]?.id ?? null;
   sequencePlayheadUs = Math.min(sequencePlayheadUs, sequenceDurationUs());
   if (editMode === "remove" && segments.length > 0) setSequencePlayhead(sequencePlayheadUs);
+  else if (editMode === "remove") video.pause();
   renderMarks();
   renderSegments();
 }
@@ -696,15 +727,12 @@ function seekBySeconds(seconds) {
   if (!currentMedia) return;
   const baseUs = currentEditTimeUs();
   if (editMode === "remove") {
-    const targetUs = baseUs + seconds * 1_000_000;
-    const snappedUs = nearestInSorted(sequenceKeyframesUs(), targetUs);
-    const mapped = sequenceToSource(snappedUs);
-    if (mapped) seekToKeyframeOrSource(mapped.sourceUs, snappedUs);
-    else setSequencePlayhead(snappedUs);
+    const targetUs = Math.max(0, Math.min(Math.round(baseUs + seconds * 1_000_000), sequenceDurationUs()));
+    setSequencePlayhead(targetUs);
   } else {
-    const targetUs = baseUs + seconds * 1_000_000;
-    const snappedUs = nearestInSorted(keyframesUs, Math.max(0, Math.min(targetUs, (video.duration || 0) * 1_000_000)));
-    seekToKeyframeOrSource(snappedUs);
+    const targetUs = Math.max(0, Math.min(Math.round(baseUs + seconds * 1_000_000), currentMedia.durationUs));
+    clearStillMode();
+    video.currentTime = targetUs / 1_000_000;
   }
 }
 
@@ -825,13 +853,15 @@ async function request(url, options) {
 
 function renderMissingPaths() {
   const missing = Array.isArray(preferences.missingPaths) ? preferences.missingPaths : [];
-  if (missing.length === 0) {
+  const recoveries = Array.isArray(preferences.recoveryWarnings) ? preferences.recoveryWarnings : [];
+  if (missing.length === 0 && recoveries.length === 0) {
     missingPathWarning.hidden = true;
     return;
   }
-  missingPathWarning.textContent = missing
-    .map((entry) => `${entry.kind === "export" ? "Export" : "Library"} folder not found: ${entry.path}`)
-    .join(" · ");
+  missingPathWarning.textContent = [
+    ...missing.map((entry) => `${entry.kind === "export" ? "Export" : "Library"} folder not found: ${entry.path}`),
+    ...recoveries.map((entry) => `Recovered invalid ${entry.name}; the original file was moved aside.`),
+  ].join(" · ");
   missingPathWarning.hidden = false;
 }
 
@@ -863,7 +893,7 @@ function applyPreviewSource(proxy) {
   metadata.textContent = `${sourceMetadataLine} · ${label}-res preview (${proxy.width}x${proxy.height})`;
 }
 
-async function waitForProxy(media) {
+async function waitForProxy(media, generation) {
   for (let attempt = 0; attempt < 240; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 2000));
     let proxy;
@@ -872,7 +902,7 @@ async function waitForProxy(media) {
     } catch {
       return;
     }
-    if (!currentMedia || currentMedia.id !== media.id) return;
+    if (!currentMedia || currentMedia.id !== media.id || generation !== previewConfigurationGeneration) return;
     if (proxy.status === "ready") {
       applyPreviewSource(proxy);
       notice.textContent = "Preview proxy ready.";
@@ -883,6 +913,7 @@ async function waitForProxy(media) {
       notice.textContent = `Preview proxy failed: ${proxy.error ?? "unknown"}`;
       return;
     }
+    if (proxy.status === "off") return;
     if (proxy.status === "pending" && Number.isFinite(proxy.progress)) {
       const percent = Math.round(proxy.progress);
       previewProgress.textContent = `Generating ${proxy.scale === "half" ? "half" : "quarter"}-res preview... ${percent}%`;
@@ -902,6 +933,7 @@ function updatePreviewControlsState() {
 }
 
 async function configurePreview(media) {
+  const generation = ++previewConfigurationGeneration;
   updatePreviewControlsState();
   const generationEnabled = preferences.previewGeneration !== false;
   if (!generationEnabled) {
@@ -924,7 +956,7 @@ async function configurePreview(media) {
   }
   try {
     const proxy = await request(`/api/media/${media.id}/proxy`);
-    if (!currentMedia || currentMedia.id !== media.id) return;
+    if (!currentMedia || currentMedia.id !== media.id || generation !== previewConfigurationGeneration) return;
     if (proxy.status === "ready") {
       applyPreviewSource(proxy);
       notice.textContent = `${proxy.scale === "half" ? "Half" : "Quarter"}-res preview ready.`;
@@ -937,12 +969,13 @@ async function configurePreview(media) {
         ? `Generating ${label}-res preview... ${percent}%`
         : `Generating ${label}-res preview...`;
       notice.textContent = previewProgress.textContent;
-      await waitForProxy(media);
+      await waitForProxy(media, generation);
       return;
     }
     previewProgress.textContent = "";
     notice.textContent = `Preview proxy unavailable: ${proxy.error ?? "unknown"}`;
   } catch {
+    if (generation !== previewConfigurationGeneration || currentMedia?.id !== media.id) return;
     previewIsProxy = false;
     previewProgress.textContent = "";
     video.src = media.streamUrl;
@@ -952,6 +985,7 @@ async function configurePreview(media) {
 }
 
 async function configureStills(media) {
+  const generation = ++stillsConfigurationGeneration;
   clearStillMode();
   stillBaseUrl = null;
   stillCount = 0;
@@ -961,7 +995,7 @@ async function configureStills(media) {
   const mediaId = media.id;
   try {
     const result = await request(`/api/media/${mediaId}/stills`);
-    if (!currentMedia || currentMedia.id !== mediaId) return;
+    if (!currentMedia || currentMedia.id !== mediaId || generation !== stillsConfigurationGeneration) return;
     stillBaseUrl = result.baseUrl ?? null;
     stillCount = result.count ?? 0;
     if (result.status === "ready") {
@@ -974,10 +1008,10 @@ async function configureStills(media) {
       }
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 500));
-        if (!currentMedia || currentMedia.id !== mediaId) return;
+        if (!currentMedia || currentMedia.id !== mediaId || generation !== stillsConfigurationGeneration) return;
         try {
           const updated = await request(`/api/media/${mediaId}/stills`);
-          if (!currentMedia || currentMedia.id !== mediaId) return;
+          if (!currentMedia || currentMedia.id !== mediaId || generation !== stillsConfigurationGeneration) return;
           stillBaseUrl = updated.baseUrl ?? stillBaseUrl;
           stillCount = updated.count ?? stillCount;
           if (updated.status === "ready") {
@@ -1026,6 +1060,36 @@ function adoptMedia(media, keyframes) {
   resetHistory();
   resetSequence(false);
   notice.textContent = `Source indexed with ${keyframesUs.length} keyframe${keyframesUs.length === 1 ? "" : "s"}.`;
+}
+
+function unloadCurrentMedia(message) {
+  mediaLoadGeneration += 1;
+  editorSessionGeneration += 1;
+  previewConfigurationGeneration += 1;
+  stillsConfigurationGeneration += 1;
+  clearStillMode();
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+  currentMedia = null;
+  keyframesUs = [];
+  segments = [];
+  selectedSegmentId = null;
+  currentProjectId = null;
+  sequencePlayheadUs = 0;
+  markInUs = 0;
+  markOutUs = 0;
+  previewIsProxy = false;
+  stillBaseUrl = null;
+  stillCount = 0;
+  viewerEmpty.hidden = false;
+  viewerTitle.textContent = "No media loaded";
+  metadata.textContent = "";
+  clearDraft();
+  resetHistory();
+  renderMarks();
+  renderSegments();
+  if (message) notice.textContent = message;
 }
 
 async function loadMedia(locator, button, generation = ++mediaLoadGeneration) {
@@ -1079,6 +1143,12 @@ async function loadLocatedMedia(name, button, generation = ++mediaLoadGeneration
   } finally {
     if (button) button.disabled = false;
   }
+}
+
+async function loadStoredSource(source, button, generation = ++mediaLoadGeneration) {
+  if (source.absolutePath && await loadMedia({ absolutePath: source.absolutePath }, button, generation)) return true;
+  if (source.relativePath && await loadMedia({ relativePath: source.relativePath }, button, generation)) return true;
+  return source.name ? loadLocatedMedia(source.name, button, generation) : false;
 }
 
 async function loadDroppedFile(file) {
@@ -1223,6 +1293,7 @@ function renderMediaManager(records) {
       if (!window.confirm(`Delete the record for "${record.name}"? Its proxies and keyframe stills are removed too.`)) return;
       try {
         await request(`/api/media/${record.id}`, { method: "DELETE" });
+        if (currentMedia?.id === record.id) unloadCurrentMedia(`Deleted the record for ${record.name}.`);
         await refreshMediaManager();
       } catch (error) {
         notice.textContent = error.message;
@@ -1242,7 +1313,7 @@ clearMediaButton.addEventListener("click", async () => {
   if (!window.confirm("Delete all clip records, proxies, and keyframe stills?")) return;
   try {
     const result = await request("/api/media", { method: "DELETE" });
-    notice.textContent = `Deleted ${result.removed} media record${result.removed === 1 ? "" : "s"}.`;
+    unloadCurrentMedia(`Deleted ${result.removed} media record${result.removed === 1 ? "" : "s"}.`);
     await refreshMediaManager();
   } catch (error) {
     notice.textContent = error.message;
@@ -1349,10 +1420,15 @@ async function loadProject(projectId, button) {
     const project = await request(`/api/projects/${projectId}`);
     if (generation !== mediaLoadGeneration) return;
     const source = project.source;
-    const loaded = source.relativePath || !source.name
-      ? await loadMedia({ relativePath: source.relativePath }, null, generation)
-      : await loadLocatedMedia(source.name, null, generation);
+    const loaded = await loadStoredSource(source, null, generation);
     if (!loaded || generation !== mediaLoadGeneration) return;
+    if (
+      (Number.isFinite(source.size) && source.size !== currentMedia.size)
+      || (Number.isFinite(source.mtimeMs) && source.mtimeMs !== currentMedia.mtimeMs)
+    ) {
+      notice.textContent = `Could not open ${project.name}: the source file has changed.`;
+      return;
+    }
     currentProjectId = project.id;
     selectedProjectId = project.id;
     projectName.value = project.name;
@@ -1663,8 +1739,18 @@ async function resetServerState() {
   adminRestartButton.disabled = true;
   try {
     await request("/api/admin/restart", { method: "POST" });
-    notice.textContent = "Server state reloaded from disk.";
-    await Promise.all([refreshAdminLog(), refreshLibrary(), refreshProjects(), refreshExportQueue()]);
+    unloadCurrentMedia("Server state reloaded from disk. Reopen media to continue editing.");
+    const savedPreferences = await request("/api/preferences");
+    preferences = {
+      ...structuredClone(DEFAULT_PREFERENCES),
+      ...savedPreferences,
+      shortcuts: { ...DEFAULT_PREFERENCES.shortcuts, ...savedPreferences.shortcuts },
+    };
+    applySidebarPreference();
+    updatePreviewControlsState();
+    renderMissingPaths();
+    await Promise.all([refreshAdminLog(), refreshLibrary(), refreshProjects(), refreshExportQueue(), refreshMediaManager()]);
+    notice.textContent = "Server state reloaded from disk. Reopen media to continue editing.";
   } catch (error) {
     notice.textContent = error.message;
   } finally {
@@ -1740,13 +1826,21 @@ function applySidebarPreference() {
 }
 
 async function persistPreferences(nextPreferences = preferences) {
-  preferences = await request("/api/preferences", {
+  const revision = ++preferenceRevision;
+  const snapshot = structuredClone(nextPreferences);
+  const write = preferenceWrite.catch(() => {}).then(() => request("/api/preferences", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(nextPreferences),
-  });
-  applySidebarPreference();
-  renderMissingPaths();
+    body: JSON.stringify(snapshot),
+  }));
+  preferenceWrite = write;
+  const saved = await write;
+  if (revision === preferenceRevision) {
+    preferences = saved;
+    applySidebarPreference();
+    renderMissingPaths();
+  }
+  return saved;
 }
 
 function toggleSidebar() {
@@ -1857,15 +1951,19 @@ async function savePreferences() {
   preferencesDraft.previewScale = previewScaleSelect.value || "source";
   preferencesDraft.previewGeneration = previewGenerationInput.checked;
   preferencesDraft.stillsSeeking = stillsSeekingInput.checked;
+  const previousLibraryPath = preferences.libraryPath;
   try {
     await persistPreferences(preferencesDraft);
     await refreshLibrary();
     updateExportControls();
-    if (currentMedia) {
+    const unloadedForLibraryChange = currentMedia && preferences.libraryPath !== previousLibraryPath;
+    if (unloadedForLibraryChange) {
+      unloadCurrentMedia("Library folder changed. Reopen media from the new library.");
+    } else if (currentMedia) {
       configurePreview(currentMedia);
       configureStills(currentMedia);
     }
-    notice.textContent = "Preferences saved and paths reloaded.";
+    if (!unloadedForLibraryChange) notice.textContent = "Preferences saved and paths reloaded.";
     return true;
   } catch (error) {
     preferencesMessage.textContent = error.message;
@@ -2091,7 +2189,12 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (preferencesDialog.open || (event.target.closest?.("input, select, textarea, [contenteditable='true']") ?? false)) return;
+  if (
+    event.defaultPrevented ||
+    preferencesDialog.open ||
+    adminDialog.open ||
+    (event.target.closest?.("input, select, textarea, button, a, [contenteditable='true']") ?? false)
+  ) return;
   const shortcut = normalizeShortcutEvent(event);
   const actionId = findShortcutAction(preferences.shortcuts, shortcut);
   const action = ACTION_MAP.get(actionId);
@@ -2155,11 +2258,18 @@ function restoreDraftToState(draft) {
 async function restoreDraft(draft) {
   if (!draft?.media) return false;
   const media = draft.media;
-  const loaded = media.relativePath
-    ? await loadMedia({ relativePath: media.relativePath }, null)
-    : await loadLocatedMedia(media.name, null);
+  const loaded = await loadStoredSource(media, null);
   if (!loaded) {
-    notice.textContent = `Could not restore ${media.name} — the file may have moved. Draft kept for manual restore.`;
+    writeDraft(draft);
+    notice.textContent = `Could not restore ${media.name}: the file may have moved. Draft kept for manual restore.`;
+    return false;
+  }
+  if (
+    (Number.isFinite(media.size) && media.size !== currentMedia.size)
+    || (Number.isFinite(media.mtimeMs) && media.mtimeMs !== currentMedia.mtimeMs)
+  ) {
+    writeDraft(draft);
+    notice.textContent = `Could not restore ${media.name}: the source file has changed. Draft kept for manual restore.`;
     return false;
   }
   restoreDraftToState(draft);
@@ -2193,6 +2303,13 @@ recoveryDismissButton.addEventListener("click", () => {
 window.addEventListener("pagehide", () => {
   try {
     localStorage.setItem(CLEAN_CLOSE_KEY, "1");
+  } catch {
+    // ignore
+  }
+});
+window.addEventListener("pageshow", () => {
+  try {
+    localStorage.setItem(CLEAN_CLOSE_KEY, "0");
   } catch {
     // ignore
   }
