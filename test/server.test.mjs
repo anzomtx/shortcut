@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +8,24 @@ import { after, before, test } from "node:test";
 import { createApp } from "../src/server.mjs";
 
 const execFileAsync = promisify(execFile);
+const nativeFetch = globalThis.fetch;
+const apiTokens = new Map();
+async function fetch(input, init = {}) {
+  const url = new URL(input);
+  const method = String(init.method ?? "GET").toUpperCase();
+  if (url.pathname.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+    let token = apiTokens.get(url.origin);
+    if (!token) {
+      const sessionResponse = await nativeFetch(`${url.origin}/api/session`);
+      token = (await sessionResponse.json()).token;
+      apiTokens.set(url.origin, token);
+    }
+    const headers = new Headers(init.headers);
+    headers.set("X-Shortcut-Token", token);
+    init = { ...init, headers };
+  }
+  return nativeFetch(url, init);
+}
 let temporaryDirectory;
 let server;
 let baseUrl;
@@ -129,6 +147,35 @@ test("lists, registers, and range-streams an H.264 MP4", async () => {
   });
   assert.equal(invalidResponse.status, 416);
   assert.equal(invalidResponse.headers.get("content-range"), `bytes */${sampleSize}`);
+});
+
+test("exposes graceful application shutdown", () => {
+  assert.equal(typeof server.shutdown, "function");
+});
+
+test("rejects unauthenticated and cross-origin mutations", async () => {
+  const unauthenticated = await nativeFetch(`${baseUrl}/api/admin/stop`, { method: "POST" });
+  assert.equal(unauthenticated.status, 403);
+
+  const session = await (await nativeFetch(`${baseUrl}/api/session`)).json();
+  const crossOrigin = await nativeFetch(`${baseUrl}/api/admin/stop`, {
+    method: "POST",
+    headers: {
+      Origin: "https://example.com",
+      "X-Shortcut-Token": session.token,
+    },
+  });
+  assert.equal(crossOrigin.status, 403);
+
+  const invalidJsonShape = await nativeFetch(`${baseUrl}/api/media`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shortcut-Token": session.token,
+    },
+    body: "null",
+  });
+  assert.equal(invalidJsonShape.status, 400);
 });
 
 test("rejects paths outside the configured media root", async () => {
@@ -942,4 +989,20 @@ test("lists and deletes media records with their proxies and stills", async () =
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...prefs, previewScale: "source", stillsScale: "half" }),
   });
+});
+
+test("refuses to delete through a symlinked still cache directory", async () => {
+  const media = await registerSample();
+  const initialDelete = await fetch(`${baseUrl}/api/media/${media.id}/stills`, { method: "DELETE" });
+  assert.equal(initialDelete.status, 200);
+
+  const target = path.join(temporaryDirectory, "stills-symlink-target");
+  const victim = path.join(target, "keep.txt");
+  await mkdir(target, { recursive: true });
+  await writeFile(victim, "keep me");
+  await symlink(target, path.join(temporaryDirectory, "data", "stills", media.id), "dir");
+
+  const response = await fetch(`${baseUrl}/api/media/${media.id}/stills`, { method: "DELETE" });
+  assert.equal(response.status, 409);
+  assert.equal(await readFile(victim, "utf8"), "keep me");
 });

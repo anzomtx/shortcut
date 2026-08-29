@@ -71,7 +71,11 @@ export function isKeyframeAligned(keyframesUs, timestampUs, toleranceUs = 1) {
 
 export async function verifyMediaSource(media) {
   const expected = media.sourceIdentity;
-  if (!expected) throw new Error("Export source identity is unavailable; recreate this export job");
+  if (!expected) {
+    const error = new Error("Export source identity is unavailable; recreate this export job");
+    error.statusCode = 409;
+    throw error;
+  }
   const current = await stat(media.path);
   if (
     current.size !== expected.size ||
@@ -79,7 +83,9 @@ export async function verifyMediaSource(media) {
     current.dev !== expected.dev ||
     current.ino !== expected.ino
   ) {
-    throw new Error("Export source changed after this job was created; recreate the export job");
+    const error = new Error("Export source changed after this job was created; recreate the export job");
+    error.statusCode = 409;
+    throw error;
   }
 }
 

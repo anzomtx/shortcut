@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, open as openFile, appendFile, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open as openFile, appendFile, lstat, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -84,6 +84,11 @@ async function appendLogLine(fileName, entry) {
 }
 
 async function readJson(request) {
+  if (!String(request.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+    const error = new Error("Content-Type must be application/json");
+    error.statusCode = 415;
+    throw error;
+  }
   const chunks = [];
   let size = 0;
 
@@ -97,13 +102,20 @@ async function readJson(request) {
     chunks.push(chunk);
   }
 
+  let value;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
     const error = new Error("Request body must be valid JSON");
     error.statusCode = 400;
     throw error;
   }
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    const error = new Error("Request body must be a JSON object");
+    error.statusCode = 400;
+    throw error;
+  }
+  return value;
 }
 
 async function scanMp4Files(root, directory = root) {
@@ -919,6 +931,7 @@ export async function createApp(options = {}) {
   const projectsPath = path.join(dataRoot, "projects.json");
   const preferencesPath = path.join(dataRoot, "preferences.json");
   const exportsPath = path.join(dataRoot, "exports.json");
+  const apiToken = randomBytes(32).toString("hex");
   await Promise.all([
     mkdir(configuredRoot, { recursive: true }),
     mkdir(cacheDirectory, { recursive: true }),
@@ -929,6 +942,8 @@ export async function createApp(options = {}) {
   ]);
   let mediaRoot = await realpath(configuredRoot);
   let outputRoot = await realpath(configuredOutputRoot);
+  const canonicalProxyDirectory = await realpath(proxyDirectory);
+  const canonicalStillRoot = await realpath(stillRoot);
   const mediaRegistry = new Map();
   const projects = await readProjects(projectsPath);
   const restoredExportJobs = await readExportJobs(exportsPath);
@@ -1006,6 +1021,34 @@ export async function createApp(options = {}) {
   const backgroundChildren = new Set();
   const proxyTasks = new Map();
 
+  async function assertSafeCacheDirectory(rootPath, canonicalRoot, targetPath = rootPath) {
+    const rootStat = await lstat(rootPath);
+    if (rootStat.isSymbolicLink()) {
+      const error = new Error("Cache root must not be a symbolic link");
+      error.statusCode = 409;
+      throw error;
+    }
+    let targetStat;
+    try {
+      targetStat = await lstat(targetPath);
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+    if (targetStat.isSymbolicLink() || !targetStat.isDirectory()) {
+      const error = new Error("Cache directory must be a real directory");
+      error.statusCode = 409;
+      throw error;
+    }
+    const resolved = await realpath(targetPath);
+    if (!isWithin(canonicalRoot, resolved)) {
+      const error = new Error("Cache directory escaped its configured root");
+      error.statusCode = 409;
+      throw error;
+    }
+    return true;
+  }
+
   function proxyDimensions(media, scale) {
     const divisor = scale === "quarter" ? 4 : 2;
     const width = media.analysis.video.width;
@@ -1047,6 +1090,7 @@ export async function createApp(options = {}) {
   }
 
   async function ensureProxy(media, scale) {
+    await verifyMediaSource(media);
     if (!preferences.previewGeneration) return { status: "off", progress: 0, error: null, dims: null };
     const key = `${media.id}:${scale}`;
     if (proxyTasks.has(key)) return proxyTasks.get(key).task;
@@ -1144,6 +1188,7 @@ export async function createApp(options = {}) {
   const stillTasks = new Map();
 
   async function deleteMediaProxies(mediaId) {
+    await assertSafeCacheDirectory(proxyDirectory, canonicalProxyDirectory);
     const entries = await readdir(proxyDirectory).catch(() => []);
     let removed = 0;
     for (const name of entries) {
@@ -1160,17 +1205,14 @@ export async function createApp(options = {}) {
 
   async function deleteMediaStills(mediaId) {
     const directory = path.join(stillRoot, mediaId);
+    await assertSafeCacheDirectory(stillRoot, canonicalStillRoot);
+    if (!await assertSafeCacheDirectory(stillRoot, canonicalStillRoot, directory)) return 0;
     let removed = 0;
     const entries = await readdir(directory).catch(() => []);
-    for (const name of entries) {
-      try {
-        await unlink(path.join(directory, name));
-        removed += 1;
-      } catch {
-        // already gone
-      }
-    }
-    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    removed = entries.length;
+    const quarantine = path.join(stillRoot, `.delete-${mediaId}-${randomUUID()}`);
+    await rename(directory, quarantine);
+    await rm(quarantine, { recursive: true, force: true });
     return removed;
   }
 
@@ -1222,6 +1264,7 @@ export async function createApp(options = {}) {
   }
 
   async function ensureStills(media) {
+    await verifyMediaSource(media);
     const expected = media.analysis.keyframesUs.length;
     if (expected === 0 || expected > STILLS_MAX_COUNT) return { status: "off", count: 0 };
     const key = media.id;
@@ -1506,9 +1549,38 @@ export async function createApp(options = {}) {
     },
   });
 
-  return createServer(async (request, response) => {
+  const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url, "http://localhost");
+      const host = String(request.headers.host ?? "");
+      const hostName = (() => {
+        try {
+          return new URL(`http://${host}`).hostname;
+        } catch {
+          return "";
+        }
+      })();
+      if (!["127.0.0.1", "localhost", "[::1]"].includes(hostName)) {
+        sendJson(response, 403, { error: "Invalid Host header" });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/session") {
+        sendJson(response, 200, { token: apiToken });
+        return;
+      }
+
+      if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+        const origin = request.headers.origin;
+        if (origin && origin !== `http://${host}`) {
+          sendJson(response, 403, { error: "Cross-origin requests are not allowed" });
+          return;
+        }
+        if (request.headers["x-shortcut-token"] !== apiToken) {
+          sendJson(response, 403, { error: "Missing or invalid API token" });
+          return;
+        }
+      }
 
       if (request.method === "GET" && url.pathname === "/api/preferences") {
         sendJson(response, 200, { ...preferences, missingPaths });
@@ -1680,6 +1752,7 @@ export async function createApp(options = {}) {
 
       if (request.method === "DELETE" && url.pathname === "/api/proxies") {
         await cancelProxyTasksFor();
+        await assertSafeCacheDirectory(proxyDirectory, canonicalProxyDirectory);
         let removed = 0;
         const entries = await readdir(proxyDirectory).catch(() => []);
         for (const name of entries) {
@@ -1999,6 +2072,7 @@ export async function createApp(options = {}) {
           sendJson(response, 404, { error: "Media is not registered" });
           return;
         }
+        await verifyMediaSource(media);
         await streamMedia(request, response, media);
         return;
       }
@@ -2189,6 +2263,16 @@ export async function createApp(options = {}) {
       else response.destroy();
     }
   });
+  server.shutdown = async () => {
+    exportQueue.stopAll();
+    await Promise.all([
+      exportQueue.waitForIdle(),
+      cancelProxyTasksFor(),
+      cancelStillsTasks(),
+    ]);
+    await exportWrite;
+  };
+  return server;
 }
 
 async function main() {

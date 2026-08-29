@@ -154,6 +154,7 @@ let savingPreferences = false;
 let mediaLoadGeneration = 0;
 let editorSessionGeneration = 0;
 let saveProjectPromise = null;
+let apiToken = null;
 
 const ICON_PATHS = {
   open: ["M3 7h6l2 2h10v9H3z", "M3 7V5h7l2 2"],
@@ -810,7 +811,12 @@ function updateControlStates() {
 }
 
 async function request(url, options) {
-  const response = await fetch(url, options);
+  const method = String(options?.method ?? "GET").toUpperCase();
+  const headers = new Headers(options?.headers);
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && apiToken) {
+    headers.set("X-Shortcut-Token", apiToken);
+  }
+  const response = await fetch(url, { ...options, headers });
   if (response.status === 204) return null;
   const data = await response.json();
   if (!response.ok) throw new Error(data.error ?? "Request failed");
@@ -830,10 +836,11 @@ function renderMissingPaths() {
 }
 
 function reportClientError(level, message, context) {
+  if (!apiToken) return;
   try {
     fetch("/api/log", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Shortcut-Token": apiToken },
       body: JSON.stringify({ level, message: String(message).slice(0, 2000), context }),
     }).catch(() => {});
   } catch {
@@ -2200,6 +2207,9 @@ window.addEventListener("unhandledrejection", (event) => {
 
 async function initialize() {
   try {
+    const sessionResponse = await fetch("/api/session");
+    if (!sessionResponse.ok) throw new Error("Unable to establish a local API session");
+    apiToken = (await sessionResponse.json()).token;
     const savedPreferences = await request("/api/preferences");
     preferences = {
       ...structuredClone(DEFAULT_PREFERENCES),
