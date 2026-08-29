@@ -4,6 +4,8 @@ import {
   buildSequenceLayout,
   getSequenceDurationUs,
   mapSequenceToSource,
+  mapSourceTimestampsToSequence,
+  resolveEditTimeUs,
   subtractSequenceRange,
 } from "../public/edit-model.js";
 
@@ -44,4 +46,38 @@ test("subtracts a range spanning an existing cut", () => {
       { sequenceInUs: 2_000_000, sequenceOutUs: 4_000_000 },
     ],
   );
+});
+
+test("maps source keyframes into the ripple-closed sequence timeline", () => {
+  const clips = [
+    { id: "first", inUs: 0, outUs: 1_000_000 },
+    { id: "second", inUs: 2_600_000, outUs: 5_000_000 },
+  ];
+  const keyframesUs = [0, 1_000_000, 2_600_000, 4_000_000];
+
+  assert.deepEqual(mapSourceTimestampsToSequence(clips, keyframesUs), [0, 1_000_000, 2_400_000]);
+  assert.equal(mapSequenceToSource(clips, 2_400_000).sourceUs, 4_000_000);
+});
+
+test("keeps still-mode source and sequence time domains separate", () => {
+  const state = {
+    editMode: "remove",
+    stillMode: true,
+    pendingSourceUs: 4_000_000,
+    pendingSequenceUs: 2_400_000,
+    sequencePlayheadUs: 2_400_000,
+    videoTimeUs: 2_600_000,
+  };
+
+  assert.equal(resolveEditTimeUs(state), 2_400_000);
+  assert.equal(resolveEditTimeUs({ ...state, editMode: "include" }), 4_000_000);
+});
+
+test("rounds sequence positions at the editor model boundary", () => {
+  const clips = [{ id: "source", inUs: 0, outUs: 10_000_000 }];
+  assert.deepEqual(mapSequenceToSource(clips, 1_234_567.6), {
+    index: 0,
+    sourceUs: 1_234_568,
+    sequenceUs: 1_234_568,
+  });
 });

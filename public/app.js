@@ -2,6 +2,8 @@ import {
   buildSequenceLayout,
   getSequenceDurationUs,
   mapSequenceToSource,
+  mapSourceTimestampsToSequence,
+  resolveEditTimeUs,
   subtractSequenceRange,
 } from "./edit-model.js";
 import { findShortcutAction, normalizeShortcutEvent } from "./shortcut-model.js";
@@ -129,7 +131,8 @@ let previewIsProxy = false;
 let stillBaseUrl = null;
 let stillCount = 0;
 let stillMode = false;
-let pendingTargetUs = null;
+let pendingSourceUs = null;
+let pendingSequenceUs = null;
 let markInUs = 0;
 let markOutUs = 0;
 let segments = [];
@@ -148,6 +151,9 @@ let preferences = structuredClone(DEFAULT_PREFERENCES);
 let preferencesDraft = structuredClone(DEFAULT_PREFERENCES);
 let capturingActionId = null;
 let savingPreferences = false;
+let mediaLoadGeneration = 0;
+let editorSessionGeneration = 0;
+let saveProjectPromise = null;
 
 const ICON_PATHS = {
   open: ["M3 7h6l2 2h10v9H3z", "M3 7V5h7l2 2"],
@@ -228,8 +234,14 @@ function timelineDurationUs() {
 }
 
 function currentEditTimeUs() {
-  if (stillMode && pendingTargetUs !== null) return pendingTargetUs;
-  return editMode === "remove" ? sequencePlayheadUs : Math.round(video.currentTime * 1_000_000);
+  return resolveEditTimeUs({
+    editMode,
+    stillMode,
+    pendingSourceUs,
+    pendingSequenceUs,
+    sequencePlayheadUs,
+    videoTimeUs: Math.round(video.currentTime * 1_000_000),
+  });
 }
 
 function isKeyframe(timestampUs) {
@@ -247,15 +259,15 @@ function isKeyframe(timestampUs) {
   );
 }
 
-function snapToKeyframe(timestampUs) {
+function snapToKeyframe(timestampUs, candidatesUs = keyframesUs) {
   let low = 0;
-  let high = keyframesUs.length;
+  let high = candidatesUs.length;
   while (low < high) {
     const middle = Math.floor((low + high) / 2);
-    if (keyframesUs[middle] < timestampUs) low = middle + 1;
+    if (candidatesUs[middle] < timestampUs) low = middle + 1;
     else high = middle;
   }
-  const candidates = [keyframesUs[low - 1], keyframesUs[low]];
+  const candidates = [candidatesUs[low - 1], candidatesUs[low]];
   let best = timestampUs;
   let bestDelta = Infinity;
   for (const keyframe of candidates) {
@@ -270,8 +282,9 @@ function snapToKeyframe(timestampUs) {
 }
 
 function snapEditPoint(timestampUs) {
-  if (preferences.onlyFastEdits) return nearestInSorted(keyframesUs, timestampUs);
-  return snapToKeyframe(timestampUs);
+  const candidatesUs = editMode === "remove" ? sequenceKeyframesUs() : keyframesUs;
+  if (preferences.onlyFastEdits) return nearestInSorted(candidatesUs, timestampUs);
+  return snapToKeyframe(timestampUs, candidatesUs);
 }
 
 function nearestInSorted(arr, targetUs) {
@@ -292,15 +305,7 @@ function nearestInSorted(arr, targetUs) {
 
 function sequenceKeyframesUs() {
   if (editMode !== "remove") return keyframesUs;
-  const result = [];
-  for (const item of sequenceLayout()) {
-    for (const keyframe of keyframesUs) {
-      if (keyframe < item.segment.inUs) continue;
-      if (keyframe >= item.segment.outUs) break;
-      result.push(item.sequenceInUs + keyframe - item.segment.inUs);
-    }
-  }
-  return result;
+  return mapSourceTimestampsToSequence(segments, keyframesUs);
 }
 
 function drawTimeline() {
@@ -619,7 +624,8 @@ function updateStillIndicator() {
 
 function clearStillMode() {
   stillMode = false;
-  pendingTargetUs = null;
+  pendingSourceUs = null;
+  pendingSequenceUs = null;
   hideStill();
   updateStillIndicator();
 }
@@ -632,8 +638,12 @@ function enterStillMode(sourceUs, sequenceUs) {
     return;
   }
   stillMode = true;
-  pendingTargetUs = sourceUs;
-  if (editMode === "remove" && Number.isFinite(sequenceUs)) sequencePlayheadUs = sequenceUs;
+  pendingSourceUs = sourceUs;
+  const sequenceTargetUs = sequenceUs ?? sourceToSequence(sourceUs) ?? sequencePlayheadUs;
+  pendingSequenceUs = editMode === "remove" && Number.isFinite(sequenceTargetUs)
+    ? Math.round(sequenceTargetUs)
+    : null;
+  if (pendingSequenceUs !== null) sequencePlayheadUs = pendingSequenceUs;
   stillElement.src = `${stillBaseUrl}${index}`;
   stillElement.hidden = false;
   updateStillIndicator();
@@ -645,26 +655,30 @@ function enterStillMode(sourceUs, sequenceUs) {
 
 stillElement.addEventListener("error", () => {
   if (!stillMode) return;
-  const target = pendingTargetUs;
+  const sourceTarget = pendingSourceUs;
+  const sequenceTarget = pendingSequenceUs;
   stillMode = false;
-  pendingTargetUs = null;
+  pendingSourceUs = null;
+  pendingSequenceUs = null;
   hideStill();
   updateStillIndicator();
-  if (Number.isFinite(target)) {
-    if (editMode === "remove") setSequencePlayhead(sourceToSequence(target) ?? 0);
-    else video.currentTime = target / 1_000_000;
+  if (Number.isFinite(sourceTarget)) {
+    if (editMode === "remove") setSequencePlayhead(sequenceTarget ?? sourceToSequence(sourceTarget) ?? 0);
+    else video.currentTime = sourceTarget / 1_000_000;
   }
 });
 
 function exitStillMode(seekTo) {
-  const target = pendingTargetUs;
+  const sourceTarget = pendingSourceUs;
+  const sequenceTarget = pendingSequenceUs;
   stillMode = false;
-  pendingTargetUs = null;
+  pendingSourceUs = null;
+  pendingSequenceUs = null;
   hideStill();
   updateStillIndicator();
-  if (seekTo && Number.isFinite(target)) {
-    if (editMode === "remove") setSequencePlayhead(sourceToSequence(target) ?? 0);
-    else video.currentTime = target / 1_000_000;
+  if (seekTo && Number.isFinite(sourceTarget)) {
+    if (editMode === "remove") setSequencePlayhead(sequenceTarget ?? sourceToSequence(sourceTarget) ?? 0);
+    else video.currentTime = sourceTarget / 1_000_000;
   }
 }
 
@@ -756,7 +770,7 @@ function seekTimeline(clientX) {
   if (!currentMedia || timelineDurationUs() <= 0) return;
   const bounds = timeline.getBoundingClientRect();
   const ratio = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
-  const targetUs = ratio * timelineDurationUs();
+  const targetUs = Math.round(ratio * timelineDurationUs());
   if (previewIsProxy) {
     if (stillMode) exitStillMode(false);
     if (editMode === "remove") setSequencePlayhead(targetUs);
@@ -984,8 +998,11 @@ async function configureStills(media) {
 
 function adoptMedia(media, keyframes) {
   clearStillMode();
+  editorSessionGeneration += 1;
   currentMedia = media;
   keyframesUs = keyframes;
+  previewIsProxy = false;
+  previewProgress.textContent = "";
   editMode = preferences.defaultEditMode;
   includeModeButton.classList.toggle("active", editMode === "include");
   removeModeButton.classList.toggle("active", editMode === "remove");
@@ -1004,7 +1021,7 @@ function adoptMedia(media, keyframes) {
   notice.textContent = `Source indexed with ${keyframesUs.length} keyframe${keyframesUs.length === 1 ? "" : "s"}.`;
 }
 
-async function loadMedia(locator, button) {
+async function loadMedia(locator, button, generation = ++mediaLoadGeneration) {
   notice.textContent = "Validating media and indexing keyframes...";
   if (button) button.disabled = true;
   try {
@@ -1018,20 +1035,22 @@ async function loadMedia(locator, button) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (generation !== mediaLoadGeneration) return false;
     const keyframeIndex = await request(media.keyframesUrl);
+    if (generation !== mediaLoadGeneration) return false;
     adoptMedia(media, keyframeIndex.keyframesUs);
     configurePreview(media);
     configureStills(media);
     return true;
   } catch (error) {
-    notice.textContent = error.message;
+    if (generation === mediaLoadGeneration) notice.textContent = error.message;
     return false;
   } finally {
     if (button) button.disabled = false;
   }
 }
 
-async function loadLocatedMedia(name, button) {
+async function loadLocatedMedia(name, button, generation = ++mediaLoadGeneration) {
   notice.textContent = `Locating "${name}" on this machine...`;
   if (button) button.disabled = true;
   try {
@@ -1040,13 +1059,15 @@ async function loadLocatedMedia(name, button) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     });
+    if (generation !== mediaLoadGeneration) return false;
     const keyframeIndex = await request(media.keyframesUrl);
+    if (generation !== mediaLoadGeneration) return false;
     adoptMedia(media, keyframeIndex.keyframesUs);
     configurePreview(media);
     configureStills(media);
     return true;
   } catch (error) {
-    notice.textContent = error.message;
+    if (generation === mediaLoadGeneration) notice.textContent = error.message;
     return false;
   } finally {
     if (button) button.disabled = false;
@@ -1060,19 +1081,23 @@ async function loadDroppedFile(file) {
   }
   notice.textContent = `Locating "${file.name}" on this machine...`;
   viewerShell.classList.add("drop-target");
+  const generation = ++mediaLoadGeneration;
   try {
     const media = await request("/api/library/locate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: file.name }),
     });
+    if (generation !== mediaLoadGeneration) return;
     const keyframeIndex = await request(media.keyframesUrl);
+    if (generation !== mediaLoadGeneration) return;
     adoptMedia(media, keyframeIndex.keyframesUs);
+    configurePreview(media);
     configureStills(media);
     await refreshLibrary();
-    notice.textContent = `Opened "${file.name}" from disk. Nothing was copied.`;
+    if (generation === mediaLoadGeneration) notice.textContent = `Opened "${file.name}" from disk. Nothing was copied.`;
   } catch (error) {
-    notice.textContent = error.message;
+    if (generation === mediaLoadGeneration) notice.textContent = error.message;
   } finally {
     viewerShell.classList.remove("drop-target");
   }
@@ -1310,15 +1335,17 @@ async function deleteProject(projectId = selectedProjectId, name = "this project
 }
 
 async function loadProject(projectId, button) {
+  const generation = ++mediaLoadGeneration;
   if (button) button.disabled = true;
   notice.textContent = "Opening saved project...";
   try {
     const project = await request(`/api/projects/${projectId}`);
+    if (generation !== mediaLoadGeneration) return;
     const source = project.source;
     const loaded = source.relativePath || !source.name
-      ? await loadMedia({ relativePath: source.relativePath }, null)
-      : await loadLocatedMedia(source.name, null);
-    if (!loaded) return;
+      ? await loadMedia({ relativePath: source.relativePath }, null, generation)
+      : await loadLocatedMedia(source.name, null, generation);
+    if (!loaded || generation !== mediaLoadGeneration) return;
     currentProjectId = project.id;
     selectedProjectId = project.id;
     projectName.value = project.name;
@@ -1337,15 +1364,16 @@ async function loadProject(projectId, button) {
     renderSegments();
     notice.textContent = `Opened ${project.name}.`;
   } catch (error) {
-    notice.textContent = error.message;
+    if (generation === mediaLoadGeneration) notice.textContent = error.message;
   } finally {
     if (button) button.disabled = false;
   }
 }
 
-async function saveProject() {
+async function performSaveProject() {
   if (!currentMedia) return null;
-  saveProjectButton.disabled = true;
+  const sessionGeneration = editorSessionGeneration;
+  const mediaId = currentMedia.id;
   notice.textContent = "Saving edit decision list...";
   try {
     const project = await request(currentProjectId ? `/api/projects/${currentProjectId}` : "/api/projects", {
@@ -1358,18 +1386,31 @@ async function saveProject() {
         segments: segments.map(({ id, inUs, outUs }) => ({ id, inUs, outUs })),
       }),
     });
+    if (sessionGeneration !== editorSessionGeneration || currentMedia?.id !== mediaId) return null;
     currentProjectId = project.id;
     selectedProjectId = project.id;
     projectName.value = project.name;
     notice.textContent = `Saved ${project.name}.`;
     await refreshProjects();
+    if (sessionGeneration !== editorSessionGeneration || currentMedia?.id !== mediaId) return null;
+    clearDraft();
     return project;
   } catch (error) {
-    notice.textContent = error.message;
+    if (sessionGeneration === editorSessionGeneration && currentMedia?.id === mediaId) {
+      notice.textContent = error.message;
+    }
     return null;
-  } finally {
-    saveProjectButton.disabled = false;
   }
+}
+
+function saveProject() {
+  if (saveProjectPromise) return saveProjectPromise;
+  saveProjectButton.disabled = true;
+  saveProjectPromise = performSaveProject().finally(() => {
+    saveProjectPromise = null;
+    saveProjectButton.disabled = false;
+  });
+  return saveProjectPromise;
 }
 
 async function beginExport(mode) {

@@ -21,13 +21,42 @@ export function mapSequenceToSource(segments, timestampUs) {
   const layout = buildSequenceLayout(segments);
   if (layout.length === 0) return null;
   const durationUs = layout.at(-1).sequenceOutUs;
-  const clamped = Math.min(Math.max(timestampUs, 0), durationUs);
+  const rounded = Number.isFinite(timestampUs) ? Math.round(timestampUs) : 0;
+  const clamped = Math.min(Math.max(rounded, 0), durationUs);
   const item = layout.find((candidate) => clamped < candidate.sequenceOutUs) ?? layout.at(-1);
   return {
     index: item.index,
     sourceUs: Math.min(item.segment.outUs, item.segment.inUs + clamped - item.sequenceInUs),
     sequenceUs: clamped,
   };
+}
+
+export function mapSourceTimestampsToSequence(segments, timestampsUs) {
+  const result = [];
+  for (const item of buildSequenceLayout(segments)) {
+    for (const timestampUs of timestampsUs) {
+      if (timestampUs < item.segment.inUs) continue;
+      if (timestampUs >= item.segment.outUs) break;
+      result.push(item.sequenceInUs + timestampUs - item.segment.inUs);
+    }
+  }
+  return result;
+}
+
+export function resolveEditTimeUs({
+  editMode,
+  stillMode,
+  pendingSourceUs,
+  pendingSequenceUs,
+  sequencePlayheadUs,
+  videoTimeUs,
+}) {
+  if (stillMode) {
+    return editMode === "remove"
+      ? pendingSequenceUs ?? sequencePlayheadUs
+      : pendingSourceUs ?? videoTimeUs;
+  }
+  return editMode === "remove" ? sequencePlayheadUs : videoTimeUs;
 }
 
 export function subtractSequenceRange(segments, startUs, endUs, createId = () => crypto.randomUUID()) {
