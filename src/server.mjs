@@ -129,7 +129,8 @@ async function scanMp4Files(root, directory = root) {
   return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
-function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, onStderr, onSpawn, children }) {
+function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress, onStderr, onSpawn, children, signal }) {
+  if (signal?.aborted) return Promise.reject(new DOMException("Background task stopped", "AbortError"));
   return new Promise((resolve, reject) => {
     const child = spawn(
       ffmpegPath,
@@ -138,16 +139,29 @@ function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress,
     );
     children?.add(child);
     if (onSpawn) onSpawn(child);
-    const stderr = [];
+    let stderr = "";
+    let progressBuffer = "";
     let progress = 0;
+    let aborted = false;
+    let killTimer = null;
+    const handleAbort = () => {
+      aborted = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      killTimer.unref?.();
+    };
+    signal?.addEventListener("abort", handleAbort, { once: true });
     child.stderr.on("data", (chunk) => {
-      stderr.push(chunk);
-      if (onStderr) onStderr(chunk.toString("utf8"));
+      const text = chunk.toString("utf8");
+      stderr = `${stderr}${text}`.slice(-64_000);
+      if (onStderr) onStderr(text);
     });
     child.stdout.on("data", (chunk) => {
       if (!onProgress) return;
-      const text = chunk.toString("utf8");
-      for (const line of text.split("\n")) {
+      progressBuffer += chunk.toString("utf8");
+      const lines = progressBuffer.split("\n");
+      progressBuffer = lines.pop();
+      for (const line of lines) {
         const match = /^out_time_ms=(\d+)$/.exec(line);
         if (match) {
           progress = Number(match[1]) / 1_000_000;
@@ -157,12 +171,20 @@ function runFfmpegToFile({ sourcePath, outputPath, ffmpegPath, args, onProgress,
     });
     child.on("error", (error) => {
       children?.delete(child);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", handleAbort);
       reject(new Error(`Unable to run ffmpeg: ${error.message}`));
     });
     child.on("close", (code) => {
       children?.delete(child);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", handleAbort);
+      if (aborted) {
+        reject(new DOMException("Background task stopped", "AbortError"));
+        return;
+      }
       if (code !== 0) {
-        reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || "ffmpeg failed"));
+        reject(new Error(stderr.trim() || "ffmpeg failed"));
         return;
       }
       resolve(progress);
@@ -1028,8 +1050,10 @@ export async function createApp(options = {}) {
     if (!preferences.previewGeneration) return { status: "off", progress: 0, error: null, dims: null };
     const key = `${media.id}:${scale}`;
     if (proxyTasks.has(key)) return proxyTasks.get(key).task;
-    const task = { status: "pending", progress: 0, error: null, dims: null, promise: null };
+    const controller = new AbortController();
+    const task = { status: "pending", progress: 0, error: null, dims: null, child: null, controller, promise: null };
     task.promise = (async () => {
+      let tempPath = null;
       try {
         if (await isProxyCurrent(media, scale)) {
           const sidecar = await readProxySidecar(media.id, scale);
@@ -1042,7 +1066,7 @@ export async function createApp(options = {}) {
         const sourceFps = media.analysis.video.averageFrameRate ?? 30;
         const previewFps = Math.max(1, Math.round(sourceFps / 2));
         const gop = Math.max(1, Math.round(previewFps));
-        const tempPath = `${proxyFilePath(media.id, scale)}.${process.pid}.tmp`;
+        tempPath = `${proxyFilePath(media.id, scale)}.${randomUUID()}.tmp`;
         logAdmin(`Generating ${scale}-res proxy for ${media.name} (${previewFps} fps)...`);
         const progressSeconds = await runFfmpegToFile({
           sourcePath: media.path,
@@ -1077,7 +1101,12 @@ export async function createApp(options = {}) {
             task.progress = duration > 0 ? Math.min(0.99, seconds / duration) : 0;
           },
           children: backgroundChildren,
+          signal: controller.signal,
+          onSpawn: (child) => {
+            task.child = child;
+          },
         });
+        if (controller.signal.aborted) throw new DOMException("Background task stopped", "AbortError");
         await rename(tempPath, proxyFilePath(media.id, scale));
         await writeFile(
           proxySidecarPath(media.id, scale),
@@ -1097,8 +1126,11 @@ export async function createApp(options = {}) {
         logAdmin(`Generated ${scale}-res proxy for ${media.name} (${dims.width}x${dims.height}, ${gop}f keyframes)`);
       } catch (error) {
         task.status = "failed";
-        task.error = error.message;
-        logAdmin(`Proxy generation failed for ${media.name}: ${error.message}`, "error");
+        task.error = error.name === "AbortError" ? "Proxy generation stopped" : error.message;
+        logAdmin(`Proxy generation failed for ${media.name}: ${task.error}`, error.name === "AbortError" ? "warn" : "error");
+      } finally {
+        task.child = null;
+        if (tempPath) await rm(tempPath, { force: true }).catch(() => {});
       }
       return task;
     })();
@@ -1169,28 +1201,24 @@ export async function createApp(options = {}) {
     };
   }
 
-  function clearProxyTasksFor(mediaId) {
-    for (const key of [...proxyTasks.keys()]) {
-      if (key.startsWith(`${mediaId}:`)) proxyTasks.delete(key);
+  async function cancelProxyTasksFor(mediaId = null) {
+    const matches = [...proxyTasks.entries()].filter(([key]) => mediaId === null || key.startsWith(`${mediaId}:`));
+    for (const [, { task }] of matches) task.controller.abort();
+    await Promise.allSettled(matches.map(([, { task }]) => task.promise));
+    for (const [key, entry] of matches) {
+      if (proxyTasks.get(key) === entry) proxyTasks.delete(key);
     }
+    return matches.filter(([, { task }]) => task.status === "failed").length;
   }
 
-  function cancelStillsTasks() {
-    for (const { task } of stillTasks.values()) {
-      if (task.child) {
-        try {
-          task.child.kill("SIGKILL");
-        } catch {
-          // already gone
-        }
-        task.child = null;
-      }
-      if (task.status === "pending") {
-        task.status = "failed";
-        task.error = "Cancelled due to a preference change";
-      }
+  async function cancelStillsTasks(mediaId = null) {
+    const matches = [...stillTasks.entries()].filter(([key]) => mediaId === null || key === mediaId);
+    for (const [, { task }] of matches) task.controller.abort();
+    await Promise.allSettled(matches.map(([, { task }]) => task.promise));
+    for (const [key, entry] of matches) {
+      if (stillTasks.get(key) === entry) stillTasks.delete(key);
     }
-    stillTasks.clear();
+    return matches.filter(([, { task }]) => task.status === "failed").length;
   }
 
   async function ensureStills(media) {
@@ -1198,7 +1226,8 @@ export async function createApp(options = {}) {
     if (expected === 0 || expected > STILLS_MAX_COUNT) return { status: "off", count: 0 };
     const key = media.id;
     if (stillTasks.has(key)) return stillTasks.get(key).task;
-    const task = { status: "pending", count: 0, progress: 0, error: null, child: null, promise: null };
+    const controller = new AbortController();
+    const task = { status: "pending", count: 0, progress: 0, error: null, child: null, controller, promise: null };
     task.promise = (async () => {
       try {
         const directory = path.join(stillRoot, media.id);
@@ -1263,6 +1292,7 @@ export async function createApp(options = {}) {
               task.child = child;
             },
             children: backgroundChildren,
+            signal: controller.signal,
           });
         } finally {
           clearInterval(progressTimer);
@@ -1310,8 +1340,10 @@ export async function createApp(options = {}) {
         logAdmin(`Extracted ${matched} of ${expected} ${scale}-res keyframe stills for ${media.name}`);
       } catch (error) {
         task.status = "failed";
-        task.error = error.message;
+        task.error = error.name === "AbortError" ? "Stills extraction stopped" : error.message;
         logAdmin(`Stills extraction failed for ${media.name}: ${error.message}`, "warn");
+      } finally {
+        task.child = null;
       }
       return task;
     })();
@@ -1494,7 +1526,8 @@ export async function createApp(options = {}) {
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/stop") {
-        const stopped = exportQueue.clear();
+        const stopped = exportQueue.stopAll();
+        await exportQueue.waitForIdle();
         await exportWrite;
         logAdmin(stopped > 0 ? `Force stopped ${stopped} export job${stopped === 1 ? "" : "s"}` : "Force stop requested with no active jobs", "warn");
         sendJson(response, 200, { stopped });
@@ -1502,27 +1535,9 @@ export async function createApp(options = {}) {
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/stop-background") {
-        let stopped = 0;
-        for (const child of backgroundChildren) {
-          try {
-            child.kill("SIGKILL");
-            stopped += 1;
-          } catch {
-            // already gone
-          }
-        }
-        for (const { task } of proxyTasks.values()) {
-          if (task.status === "pending") {
-            task.status = "failed";
-            task.error = "Stopped from the admin console";
-          }
-        }
-        for (const { task } of stillTasks.values()) {
-          if (task.status === "pending") {
-            task.status = "failed";
-            task.error = "Stopped from the admin console";
-          }
-        }
+        const stopped = [...proxyTasks.values(), ...stillTasks.values()]
+          .filter(({ task }) => task.status === "pending").length;
+        await Promise.all([cancelProxyTasksFor(), cancelStillsTasks()]);
         logAdmin(stopped > 0 ? `Stopped ${stopped} background FFmpeg process${stopped === 1 ? "" : "es"}` : "No background FFmpeg processes were running", "warn");
         sendJson(response, 200, { stopped });
         return;
@@ -1530,7 +1545,9 @@ export async function createApp(options = {}) {
 
       if (request.method === "POST" && url.pathname === "/api/admin/restart") {
         logAdmin("Resetting server state...", "warn");
-        exportQueue.clear();
+        exportQueue.stopAll();
+        await exportQueue.waitForIdle();
+        await Promise.all([cancelProxyTasksFor(), cancelStillsTasks()]);
         await exportWrite;
         mediaRegistry.clear();
         projects.clear();
@@ -1571,11 +1588,16 @@ export async function createApp(options = {}) {
 
       if (request.method === "POST" && url.pathname === "/api/admin/shutdown") {
         logAdmin("Server shutdown requested...", "warn");
-        const stopped = exportQueue.clear();
+        const stopped = exportQueue.stopAll();
+        await Promise.all([
+          exportQueue.waitForIdle(),
+          cancelProxyTasksFor(),
+          cancelStillsTasks(),
+        ]);
         await exportWrite;
         sendJson(response, 200, { ok: true, stopped, message: "Server is shutting down" });
         logAdmin("Server stopped");
-        setTimeout(() => process.exit(0), 300);
+        setTimeout(() => process.exit(0), 100);
         return;
       }
 
@@ -1640,7 +1662,7 @@ export async function createApp(options = {}) {
         };
         await persistPreferences();
         if (preferences.stillsScale !== previousStillsScale) {
-          cancelStillsTasks();
+          await cancelStillsTasks();
           logAdmin(`Keyframe stills resolution changed to ${preferences.stillsScale}; regenerating`, "warn");
         }
         if (preferences.previewGeneration && preferences.previewScale !== "source") {
@@ -1657,6 +1679,7 @@ export async function createApp(options = {}) {
       }
 
       if (request.method === "DELETE" && url.pathname === "/api/proxies") {
+        await cancelProxyTasksFor();
         let removed = 0;
         const entries = await readdir(proxyDirectory).catch(() => []);
         for (const name of entries) {
@@ -1668,7 +1691,6 @@ export async function createApp(options = {}) {
             // already gone
           }
         }
-        proxyTasks.clear();
         logAdmin(`Cleared ${removed} preview proxy file${removed === 1 ? "" : "s"}`);
         sendJson(response, 200, { removed });
         return;
@@ -2095,11 +2117,9 @@ export async function createApp(options = {}) {
           sendJson(response, 404, { error: "Media is not registered" });
           return;
         }
-        await deleteMediaProxies(media.id);
-        await deleteMediaStills(media.id);
+        await Promise.all([cancelProxyTasksFor(media.id), cancelStillsTasks(media.id)]);
+        await Promise.all([deleteMediaProxies(media.id), deleteMediaStills(media.id)]);
         mediaRegistry.delete(media.id);
-        clearProxyTasksFor(media.id);
-        stillTasks.delete(media.id);
         logAdmin(`Deleted media record ${media.name} with proxies and stills`, "warn");
         sendJson(response, 200, { removed: true });
         return;
@@ -2112,8 +2132,8 @@ export async function createApp(options = {}) {
           sendJson(response, 404, { error: "Media is not registered" });
           return;
         }
+        await cancelStillsTasks(media.id);
         const removed = await deleteMediaStills(media.id);
-        stillTasks.delete(media.id);
         logAdmin(`Deleted ${removed} still file${removed === 1 ? "" : "s"} for ${media.name}`, "warn");
         sendJson(response, 200, { removed });
         return;
@@ -2126,14 +2146,15 @@ export async function createApp(options = {}) {
           sendJson(response, 404, { error: "Media is not registered" });
           return;
         }
+        await cancelProxyTasksFor(media.id);
         const removed = await deleteMediaProxies(media.id);
-        clearProxyTasksFor(media.id);
         logAdmin(`Deleted ${removed} proxy file${removed === 1 ? "" : "s"} for ${media.name}`, "warn");
         sendJson(response, 200, { removed });
         return;
       }
 
       if (request.method === "DELETE" && url.pathname === "/api/media") {
+        await Promise.all([cancelProxyTasksFor(), cancelStillsTasks()]);
         let removedRecords = 0;
         for (const media of [...mediaRegistry.values()]) {
           await deleteMediaProxies(media.id);
@@ -2141,8 +2162,6 @@ export async function createApp(options = {}) {
           removedRecords += 1;
         }
         mediaRegistry.clear();
-        proxyTasks.clear();
-        stillTasks.clear();
         logAdmin(`Deleted ${removedRecords} media record${removedRecords === 1 ? "" : "s"} with proxies and stills`, "warn");
         sendJson(response, 200, { removed: removedRecords });
         return;
@@ -2195,6 +2214,22 @@ async function main() {
     }).finally(() => process.exit(1));
   });
   const server = await createApp();
+  let shuttingDown = false;
+  const shutdown = async (exitCode = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const forceTimer = setTimeout(() => process.exit(exitCode || 1), 10_000);
+    forceTimer.unref?.();
+    try {
+      await server.shutdown();
+      await new Promise((resolve) => server.close(resolve));
+    } finally {
+      clearTimeout(forceTimer);
+      process.exit(exitCode);
+    }
+  };
+  process.on("SIGINT", () => { shutdown(0); });
+  process.on("SIGTERM", () => { shutdown(0); });
   server.listen(port, host, () => {
     console.log(`Shortcut is running at http://${host}:${port}`);
   });

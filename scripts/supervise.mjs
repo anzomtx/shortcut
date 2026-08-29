@@ -10,6 +10,9 @@ const LOG_DIRECTORY = path.join(ROOT, "logs");
 let child = null;
 let stopping = false;
 let restartCount = 0;
+let stopSignal = null;
+let killTimer = null;
+let stabilityTimer = null;
 
 async function appendLogLine(entry) {
   try {
@@ -23,6 +26,8 @@ async function appendLogLine(entry) {
 function startServer() {
   if (stopping) return;
   child = spawn(process.execPath, [SERVER_PATH], { stdio: "inherit" });
+  stabilityTimer = setTimeout(() => { restartCount = 0; }, 30_000);
+  stabilityTimer.unref?.();
   child.on("error", (error) => {
     appendLogLine({
       at: new Date().toISOString(),
@@ -32,7 +37,12 @@ function startServer() {
   });
   child.on("exit", (code, signal) => {
     child = null;
-    if (stopping) return;
+    clearTimeout(killTimer);
+    clearTimeout(stabilityTimer);
+    if (stopping) {
+      process.exit(stopSignal === "SIGINT" ? 130 : 143);
+      return;
+    }
     if (code === 0) {
       appendLogLine({
         at: new Date().toISOString(),
@@ -47,18 +57,25 @@ function startServer() {
       at: new Date().toISOString(),
       level: "error",
       message: `Server exited unexpectedly (code=${code}, signal=${signal}); restarting (attempt ${restartCount})`,
-    }).then(() => setTimeout(startServer, 1000));
+    }).then(() => setTimeout(startServer, Math.min(1000 * 2 ** Math.min(restartCount - 1, 5), 30_000)));
   });
 }
 
-process.on("SIGINT", () => {
+function stop(signal) {
+  if (stopping) return;
   stopping = true;
-  child?.kill("SIGINT");
-});
-process.on("SIGTERM", () => {
-  stopping = true;
-  child?.kill("SIGTERM");
-});
+  stopSignal = signal;
+  if (!child) {
+    process.exit(signal === "SIGINT" ? 130 : 143);
+    return;
+  }
+  child.kill(signal);
+  killTimer = setTimeout(() => child?.kill("SIGKILL"), 12_000);
+  killTimer.unref?.();
+}
+
+process.on("SIGINT", () => { stop("SIGINT"); });
+process.on("SIGTERM", () => { stop("SIGTERM"); });
 
 appendLogLine({ at: new Date().toISOString(), level: "info", message: "Supervisor starting" });
 startServer();

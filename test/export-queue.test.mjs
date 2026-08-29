@@ -107,3 +107,20 @@ test("does not allow cancellation after finalization starts", async () => {
   releaseFinalization();
   await waitForStatus(queue, "1", "completed");
 });
+
+test("stops all work without deleting queue history", async () => {
+  const queue = new ExportQueue({
+    runner: async (_job, control) => {
+      await new Promise((resolve, reject) => {
+        control.signal.addEventListener("abort", () => reject(new DOMException("Stopped", "AbortError")), { once: true });
+      });
+    },
+  });
+  queue.add(createJob("1"));
+  queue.add(createJob("2"));
+  await waitForStatus(queue, "1", "running");
+
+  assert.equal(queue.stopAll(), 2);
+  await queue.waitForIdle();
+  assert.deepEqual(queue.list().map((job) => job.status), ["stopped", "stopped"]);
+});

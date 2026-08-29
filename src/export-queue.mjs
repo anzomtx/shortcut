@@ -1,6 +1,7 @@
 export class ExportQueue {
   #activeJobId = null;
   #controls = new Map();
+  #idleWaiters = [];
   #jobs = new Map();
   #onChange;
   #runner;
@@ -34,6 +35,22 @@ export class ExportQueue {
     }
     this.#notify(null);
     return jobs.length;
+  }
+
+  stopAll() {
+    let stopped = 0;
+    for (const job of this.list()) {
+      if (this.stop(job.id)) stopped += 1;
+    }
+    this.#resolveIdle();
+    return stopped;
+  }
+
+  waitForIdle() {
+    if (this.#activeJobId === null && !this.list().some((job) => job.status === "queued")) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.#idleWaiters.push(resolve));
   }
 
   remove(id) {
@@ -105,6 +122,11 @@ export class ExportQueue {
     this.#onChange(job, this.list());
   }
 
+  #resolveIdle() {
+    if (this.#activeJobId !== null || this.list().some((job) => job.status === "queued")) return;
+    for (const resolve of this.#idleWaiters.splice(0)) resolve();
+  }
+
   async #drain() {
     if (this.#activeJobId) return;
     const job = this.list().find((candidate) => candidate.status === "queued");
@@ -157,6 +179,7 @@ export class ExportQueue {
       this.#controls.delete(job.id);
       this.#activeJobId = null;
       this.#notify(job);
+      this.#resolveIdle();
       queueMicrotask(() => this.#drain());
     }
   }
